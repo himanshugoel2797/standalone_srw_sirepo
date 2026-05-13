@@ -136,7 +136,10 @@ Write-Host "Bootstrapping pip..."
 if ($LASTEXITCODE -ne 0) { throw "get-pip.py failed (exit $LASTEXITCODE)" }
 
 # --- 6. Install worker deps ---
-$pkgs = @('pip', 'wheel', 'setuptools', 'numpy', 'fastapi', 'uvicorn[standard]')
+#   wsgidav + a2wsgi serve the Windows source tree to the QEMU VM as WebDAV
+#   (mounted via davfs2 inside cloud-init). Same process as the FastAPI /run
+#   worker -- the WSGI app gets mounted under /dav.
+$pkgs = @('pip', 'wheel', 'setuptools', 'numpy', 'fastapi', 'uvicorn[standard]', 'wsgidav', 'a2wsgi')
 if (-not $NoSrwpy) { $pkgs += 'srwpy' }
 
 Write-Host "pip install $($pkgs -join ' ')..."

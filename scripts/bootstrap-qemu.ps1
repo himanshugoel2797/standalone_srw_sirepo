@@ -54,6 +54,9 @@ param(
     [int]   $Memory        = 4,
     [int]   $Cpus          = 2,
     [int]   $HostPort      = 8000,
+    [int]   $WorkerPort    = 8311,
+    [string]$SirepoRef     = 'master',
+    [string]$PykernRef     = 'master',
     [switch]$Force,
     [switch]$NoStart
 )
@@ -66,7 +69,6 @@ $ProjectRoot   = Split-Path -Parent $PSScriptRoot
 $Msys64Dir     = Join-Path $ProjectRoot 'msys64'
 $VmDir         = Join-Path $ProjectRoot 'qemu-vm'
 $CacheDir      = Join-Path $ProjectRoot '.cache'
-$InstallShHost = Join-Path $PSScriptRoot 'install-sirepo.sh'
 $MsysBootstrap = Join-Path $PSScriptRoot 'bootstrap-msys2.ps1'
 
 $BootstrapMarker  = Join-Path $Msys64Dir '.sirepo-win-bootstrap-ok'
@@ -81,6 +83,13 @@ $BaseImage      = Join-Path $CacheDir 'ubuntu-24.04-noble-amd64.qcow2'
 $OverlayImage   = Join-Path $VmDir 'overlay.qcow2'
 $SeedIso        = Join-Path $VmDir 'seed.iso'
 
+$SirepoDir      = Join-Path $ProjectRoot 'sirepo'
+$PykernDir      = Join-Path $ProjectRoot 'pykern'
+
+# Slirp NATs guest -> 10.0.2.2 to host's 127.0.0.1 by default. The VM mounts
+# http://10.0.2.2:$WorkerPort/dav/ via davfs2 to see the Windows project tree.
+$WebdavGuestUrl = "http://10.0.2.2:$WorkerPort/dav/"
+
 Write-Host "=== Sirepo_Win embedded-VM (QEMU/TCG) bootstrap ==="
 Write-Host "project root: $ProjectRoot"
 Write-Host "msys64 dir:   $Msys64Dir  (portable QEMU lives here)"
@@ -88,6 +97,30 @@ Write-Host "vm dir:       $VmDir"
 Write-Host ""
 
 New-Item -ItemType Directory -Force -Path $VmDir, $CacheDir | Out-Null
+
+function Sync-Repo {
+    # Clone-or-update a git repo at Dest, checked out at Ref. Duplicated from
+    # install-sirepo.ps1 -- both backends need the source on the Windows side.
+    # TODO: factor into common.psm1 if a third caller appears.
+    param([string]$Url, [string]$Dest, [string]$Ref)
+    if (-not (Test-Path $Dest)) {
+        Write-Host "Cloning $Url -> $Dest"
+        & git clone --depth 50 $Url $Dest
+        if ($LASTEXITCODE -ne 0) { throw "git clone failed for $Url" }
+    } else {
+        Write-Host "$Dest exists; fetching..."
+        Push-Location $Dest
+        try {
+            & git fetch --depth 50 origin
+            if ($LASTEXITCODE -ne 0) { throw "git fetch failed in $Dest" }
+        } finally { Pop-Location }
+    }
+    Push-Location $Dest
+    try {
+        & git checkout $Ref 2>&1 | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw "git checkout $Ref failed in $Dest" }
+    } finally { Pop-Location }
+}
 
 # --- 1. Bootstrap MSYS2 (portable, no admin) ---
 if (-not (Test-Path $BootstrapMarker)) {
@@ -174,11 +207,24 @@ if ((Test-Path $OverlayImage) -and -not $Force) {
     if ($LASTEXITCODE -ne 0) { throw "qemu-img create failed" }
 }
 
-# --- 5. Build cloud-init seed ISO via IMAPI2 COM (Windows built-in) ---
+# --- 5. Ensure sirepo + pykern source on Windows side ---
+# The VM mounts the project tree over WebDAV (see step 6) and pip installs
+# Sirepo from /mnt/host-src/sirepo. Source has to exist before the VM tries
+# to read it.
+Write-Host ""
+Write-Host "--- Syncing sirepo + pykern source on Windows side ---"
+Sync-Repo -Url 'https://github.com/radiasoft/pykern.git' -Dest $PykernDir -Ref $PykernRef
+Sync-Repo -Url 'https://github.com/radiasoft/sirepo.git' -Dest $SirepoDir -Ref $SirepoRef
+
+# --- 6. Build cloud-init seed ISO via IMAPI2 COM (Windows built-in) ---
+# user-data tells the VM to:
+#   1. apt install davfs2 + cifs-utils (cifs as fallback)
+#   2. configure davfs2 to do anonymous Basic auth, no locks, no caching
+#   3. mount $WebdavGuestUrl at /mnt/host-src
+#   4. run install-sirepo.sh out of the mounted source tree (editable install)
+# install-sirepo.sh is no longer embedded -- it comes through the mount.
 Write-Host ""
 Write-Host "--- Generating cloud-init seed ISO ---"
-$installShContent = (Get-Content -Raw $InstallShHost) -replace "`r",''
-$indentedShContent = ($installShContent -split "`n" | ForEach-Object { '      ' + $_ }) -join "`n"
 
 $userData = @"
 #cloud-config
@@ -194,17 +240,13 @@ users:
     plain_text_passwd: sirepo
 
 write_files:
-  - path: /usr/local/bin/install-sirepo.sh
-    permissions: '0755'
-    content: |
-$indentedShContent
   - path: /etc/systemd/system/sirepo.service
     permissions: '0644'
     content: |
       [Unit]
       Description=Sirepo (SRW)
-      After=network-online.target
-      Wants=network-online.target
+      After=network-online.target host-src.mount
+      Wants=network-online.target host-src.mount
 
       [Service]
       Type=simple
@@ -219,11 +261,37 @@ $indentedShContent
 
       [Install]
       WantedBy=multi-user.target
+  - path: /etc/davfs2/secrets
+    permissions: '0600'
+    content: |
+      $WebdavGuestUrl guest guest
+  - path: /usr/local/sbin/mount-host-src.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      mkdir -p /mnt/host-src
+      # Quiet davfs2 prompts; allow anonymous; disable client-side caching so
+      # Windows-side edits land instantly.
+      sed -i 's|^# *ask_auth .*|ask_auth 0|' /etc/davfs2/davfs2.conf
+      sed -i 's|^# *use_locks .*|use_locks 0|' /etc/davfs2/davfs2.conf
+      sed -i 's|^# *gui_optimize .*|gui_optimize 0|' /etc/davfs2/davfs2.conf
+      # Retry briefly in case the worker isn't yet up when cloud-init runs.
+      for i in 1 2 3 4 5; do
+          if mount -t davfs -o rw,_netdev $WebdavGuestUrl /mnt/host-src; then
+              echo "host-src mounted"; exit 0
+          fi
+          echo "mount attempt `$i failed; sleeping"
+          sleep 5
+      done
+      echo "ERROR: could not mount $WebdavGuestUrl after 5 tries" >&2
+      exit 1
 
 runcmd:
-  - git clone --depth 50 https://github.com/radiasoft/sirepo.git /opt/sirepo
-  - git clone --depth 50 https://github.com/radiasoft/pykern.git /opt/pykern
-  - bash /usr/local/bin/install-sirepo.sh /opt/sirepo /opt/pykern
+  - apt-get update -qq
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y davfs2
+  - /usr/local/sbin/mount-host-src.sh
+  - bash /mnt/host-src/scripts/install-sirepo.sh --patches /mnt/host-src/sirepo_patches /mnt/host-src/sirepo /mnt/host-src/pykern
   - systemctl daemon-reload
   - systemctl enable --now sirepo.service
 "@
@@ -324,12 +392,41 @@ Write-Host ""
 Write-Host "VM artifacts ready."
 
 if ($NoStart) {
-    Write-Host "Skipping QEMU launch (-NoStart). Launch manually with:"
+    Write-Host "Skipping QEMU launch (-NoStart). Before launching, start the worker"
+    Write-Host "(serves /run + /dav over WebDAV at port $WorkerPort):"
+    Write-Host "  & '$ProjectRoot\python-native\python.exe' '$ProjectRoot\worker\worker.py' --port $WorkerPort"
+    Write-Host "Then launch QEMU:"
     Write-Host "  $QemuExe -m ${Memory}G -smp $Cpus -drive file=$OverlayImage,format=qcow2,if=virtio -drive file=$SeedIso,format=raw,media=cdrom -netdev user,id=net0,hostfwd=tcp::${HostPort}-:8000 -device virtio-net,netdev=net0 -nographic"
     exit 0
 }
 
-# --- 7. Launch QEMU ---
+# --- 7. Worker-running guard ---
+# cloud-init mounts http://10.0.2.2:$WorkerPort/dav/ in the guest, NATed by
+# slirp to the host's 127.0.0.1. If the worker isn't running, the mount-retry
+# loop in cloud-init will eventually give up and Sirepo won't install. Bail
+# early so the user knows.
+Write-Host ""
+Write-Host "--- Checking worker on 127.0.0.1:$WorkerPort ---"
+try {
+    $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$WorkerPort/health" `
+                              -UseBasicParsing -TimeoutSec 3
+    $body = if ($resp.Content -is [byte[]]) {
+        [System.Text.Encoding]::UTF8.GetString($resp.Content)
+    } else { [string]$resp.Content }
+    Write-Host "  worker OK: $($body.Substring(0, [Math]::Min(120, $body.Length)))..."
+} catch {
+    Write-Host ""
+    Write-Host "ERROR: native worker is not responding on 127.0.0.1:$WorkerPort." -ForegroundColor Red
+    Write-Host "The QEMU guest needs to mount http://10.0.2.2:$WorkerPort/dav/ via WebDAV"
+    Write-Host "before cloud-init can install Sirepo. Start the worker first:"
+    Write-Host ""
+    Write-Host "  & '$ProjectRoot\python-native\python.exe' '$ProjectRoot\worker\worker.py' --port $WorkerPort"
+    Write-Host ""
+    Write-Host "(Or run scripts\bootstrap-python-native.ps1 if the python-native bundle is missing.)"
+    throw "Worker not running."
+}
+
+# --- 8. Launch QEMU ---
 Write-Host ""
 Write-Host "=== Launching QEMU (TCG, software emulation) ==="
 Write-Host "First boot is SLOW under TCG: ~5-15 min to boot Ubuntu, +10-20 min for cloud-init to install Sirepo."
