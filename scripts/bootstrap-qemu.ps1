@@ -16,15 +16,24 @@
        portable alternative.)
     2. pacman-install mingw-w64-x86_64-qemu. ~500 MB of QEMU+deps land in
        msys64\mingw64\.
-    3. Download Ubuntu 24.04 cloud qcow2 image, verify SHA256.
-    4. Create a writable overlay qcow2 so the base image stays pristine.
-    5. Generate a NoCloud cloud-init seed ISO via Windows' built-in IMAPI2
-       COM API, embedding user-data + meta-data + a copy of
-       install-sirepo.sh.
-    6. Launch QEMU with user-mode networking + hostfwd of $HostPort:8000.
+    3. Download Ubuntu 22.04 (jammy) cloud qcow2 image, verify SHA256.
+       Jammy chosen over noble (24.04) because noble's 6.8 kernel panics on
+       IO-APIC timer init under QEMU TCG. Override $UbuntuUrl to pick a
+       different release.
+    4. Sync sirepo + pykern source on the Windows side (via git). The VM
+       sees these through the WebDAV mount, not via a clone-inside-VM.
+    5. Create a writable overlay qcow2 so the base image stays pristine.
+    6. Generate a NoCloud cloud-init seed ISO embedding the systemd unit,
+       davfs2 secrets, and a mount-host-src.sh helper. cloud-init's runcmd
+       installs davfs2, mounts the WebDAV share, then runs install-sirepo.sh
+       straight out of the mounted Windows source.
+    7. Before launching QEMU: verify the worker (which serves /run + /dav)
+       is running on 127.0.0.1:$WorkerPort. Fail fast if not.
+    8. Launch QEMU with user-mode networking + hostfwd of $HostPort:8000.
 
   Cloud-init installs and starts Sirepo on first boot. Total bundle for the
-  QEMU backend (msys64 + QEMU + Ubuntu image + overlay): ~1.5 GB.
+  QEMU backend (msys64 + QEMU + Ubuntu jammy image + overlay + python-native):
+  ~1.5 GB.
 
 .PARAMETER UbuntuUrl
   HTTPS URL of Ubuntu cloud qcow2.
@@ -49,8 +58,14 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$UbuntuUrl     = 'https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img',
-    [string]$Sha256SumsUrl = 'https://cloud-images.ubuntu.com/noble/current/SHA256SUMS',
+    # Ubuntu 22.04 (jammy, kernel 5.15) is the well-trodden TCG combo. Noble
+    # (24.04, kernel 6.8) panics on IO-APIC timer init under TCG -- working
+    # around that needs -kernel/-initrd/-append "noapic" + tracking the
+    # cloud-images unpacked artifacts separately. Not worth the fragility for
+    # a backend whose job is to be a portable demo target. Override these
+    # params if you have a TCG fix and want noble back.
+    [string]$UbuntuUrl     = 'https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img',
+    [string]$Sha256SumsUrl = 'https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS',
     [int]   $Memory        = 4,
     [int]   $Cpus          = 2,
     [int]   $HostPort      = 8000,
@@ -79,7 +94,7 @@ $QemuExe        = Join-Path $Msys64Dir 'mingw64\bin\qemu-system-x86_64.exe'
 $QemuImgExe     = Join-Path $Msys64Dir 'mingw64\bin\qemu-img.exe'
 $QemuShareDir   = Join-Path $Msys64Dir 'mingw64\share\qemu'
 
-$BaseImage      = Join-Path $CacheDir 'ubuntu-24.04-noble-amd64.qcow2'
+$BaseImage      = Join-Path $CacheDir 'ubuntu-22.04-jammy-amd64.qcow2'
 $OverlayImage   = Join-Path $VmDir 'overlay.qcow2'
 $SeedIso        = Join-Path $VmDir 'seed.iso'
 
@@ -158,7 +173,7 @@ Write-Host "Using: $QemuExe"
 
 # --- 3. Download Ubuntu cloud qcow2 + verify SHA256 ---
 Write-Host ""
-Write-Host "--- Ubuntu 24.04 cloud image ---"
+Write-Host "--- Ubuntu cloud image ($UbuntuUrl) ---"
 
 function Get-Sha256FromSums {
     param([string]$Url, [string]$Filename)
