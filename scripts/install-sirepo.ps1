@@ -42,6 +42,7 @@ $WslMarker     = Join-Path $ProjectRoot "wsl\.wsl-bootstrap-$DistroName-ok"
 $Stage3Marker  = Join-Path $ProjectRoot "wsl\.wsl-sirepo-$DistroName-ok"
 $SirepoDir     = Join-Path $ProjectRoot 'sirepo'
 $PykernDir     = Join-Path $ProjectRoot 'pykern'
+$PatchesDir    = Join-Path $ProjectRoot 'sirepo_patches'
 $InstallShHost = Join-Path $PSScriptRoot 'install-sirepo.sh'
 
 if (-not (Test-Path $WslMarker)) {
@@ -95,12 +96,14 @@ function Convert-WindowsPathToWsl {
 $sirepoWsl    = Convert-WindowsPathToWsl $SirepoDir
 $pykernWsl    = Convert-WindowsPathToWsl $PykernDir
 $installShWsl = Convert-WindowsPathToWsl $InstallShHost
+$patchesWsl   = if (Test-Path $PatchesDir) { Convert-WindowsPathToWsl $PatchesDir } else { '' }
 
 Write-Host ""
 Write-Host "Source paths (visible inside distro):"
 Write-Host "  install-sirepo.sh -> $installShWsl"
 Write-Host "  sirepo            -> $sirepoWsl"
 Write-Host "  pykern            -> $pykernWsl"
+if ($patchesWsl) { Write-Host "  patches           -> $patchesWsl" }
 
 # --- 3. Ensure install-sirepo.sh has LF endings (bash chokes on CRLF shebangs) ---
 $shContent = Get-Content -Raw $InstallShHost
@@ -113,8 +116,11 @@ if ($shContent -match "`r`n") {
 # --- 4. Run install-sirepo.sh inside the distro ---
 Write-Host ""
 Write-Host "=== Running install-sirepo.sh inside '$DistroName' (2-5 min) ==="
-$forceArg = if ($Force) { '--force' } else { '' }
-$bashCmd  = "bash $installShWsl $forceArg '$sirepoWsl' '$pykernWsl'"
+$argList = @()
+if ($Force)       { $argList += '--force' }
+if ($patchesWsl)  { $argList += @('--patches', "'$patchesWsl'") }
+$argList += @("'$sirepoWsl'", "'$pykernWsl'")
+$bashCmd = "bash $installShWsl $($argList -join ' ')"
 & wsl.exe -d $DistroName --user root -- bash -c $bashCmd
 if ($LASTEXITCODE -ne 0) {
     throw "install-sirepo.sh failed inside distro (exit $LASTEXITCODE)"
