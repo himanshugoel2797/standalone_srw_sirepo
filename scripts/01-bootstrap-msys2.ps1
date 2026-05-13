@@ -37,7 +37,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Version = '2024-11-16',
+    [string]$Version = '2026-03-22',
     [string]$ExpectedSha256 = '',
     [switch]$SkipUpdate,
     [switch]$Force
