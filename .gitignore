@@ -4,6 +4,7 @@
 /msmpi/
 /sirepo/
 /pykern/
+/wsl/
 
 # Download cache + extractor tools fetched at bootstrap time.
 /.cache/
