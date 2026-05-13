@@ -20,16 +20,19 @@
        Jammy chosen over noble (24.04) because noble's 6.8 kernel panics on
        IO-APIC timer init under QEMU TCG. Override $UbuntuUrl to pick a
        different release.
-    4. Sync sirepo + pykern source on the Windows side (via git). The VM
-       sees these through the WebDAV mount, not via a clone-inside-VM.
-    5. Create a writable overlay qcow2 so the base image stays pristine.
-    6. Generate a NoCloud cloud-init seed ISO embedding the systemd unit,
-       davfs2 secrets, and a mount-host-src.sh helper. cloud-init's runcmd
-       installs davfs2, mounts the WebDAV share, then runs install-sirepo.sh
-       straight out of the mounted Windows source.
-    7. Before launching QEMU: verify the worker (which serves /run + /dav)
+    4. Create a writable overlay qcow2 so the base image stays pristine.
+    5. Generate a NoCloud cloud-init seed ISO inlining install-sirepo.sh,
+       the windows_native job-driver patch, the sirepo.service unit, and a
+       mount-host-runs.sh helper. cloud-init's runcmd: apt install davfs2
+       + git, mount the worker's WebDAV /dav share at /mnt/host-runs (narrow
+       data pipe -- just SRW job dirs), git clone sirepo+pykern to /opt/,
+       run install-sirepo.sh --patches.
+    6. Before launching QEMU: verify the worker (which serves /run + /dav)
        is running on 127.0.0.1:$WorkerPort. Fail fast if not.
-    8. Launch QEMU with user-mode networking + hostfwd of $HostPort:8000.
+    7. Launch QEMU with user-mode networking + hostfwd of $HostPort:8000.
+       Tries WHPX first (Windows Hypervisor Platform, ~1.5x native), falls
+       back to TCG software emulation (10-50x slower for SRW FP work, but
+       Sirepo itself is just I/O/HTTP -- compute is on the Windows side).
 
   Cloud-init installs and starts Sirepo on first boot. Total bundle for the
   QEMU backend (msys64 + QEMU + Ubuntu jammy image + overlay + python-native):
@@ -98,11 +101,18 @@ $BaseImage      = Join-Path $CacheDir 'ubuntu-22.04-jammy-amd64.qcow2'
 $OverlayImage   = Join-Path $VmDir 'overlay.qcow2'
 $SeedIso        = Join-Path $VmDir 'seed.iso'
 
-$SirepoDir      = Join-Path $ProjectRoot 'sirepo'
-$PykernDir      = Join-Path $ProjectRoot 'pykern'
+$InstallShHost  = Join-Path $PSScriptRoot 'install-sirepo.sh'
+$PatchesHost    = Join-Path $ProjectRoot 'sirepo_patches'
+$RunsHost       = Join-Path $ProjectRoot 'state\runs'
 
 # Slirp NATs guest -> 10.0.2.2 to host's 127.0.0.1 by default. The VM mounts
-# http://10.0.2.2:$WorkerPort/dav/ via davfs2 to see the Windows project tree.
+# http://10.0.2.2:$WorkerPort/dav/ via davfs2 at /mnt/host-runs. The WebDAV
+# share is NARROW: only the SRW job run-dir tree (state/runs). Sirepo source
+# is cloned inside the VM at /opt/{sirepo,pykern} -- no symlink/WebDAV-import
+# gymnastics, just normal ext4. The windows_native job driver writes a job's
+# run.py + inputs into /mnt/host-runs/<jid>/, then HTTP POSTs the worker's
+# /run endpoint pointing at that path; the worker reads it back from
+# $RunsHost on the Windows side and executes natively.
 $WebdavGuestUrl = "http://10.0.2.2:$WorkerPort/dav/"
 
 Write-Host "=== Sirepo_Win embedded-VM (QEMU/TCG) bootstrap ==="
@@ -111,31 +121,7 @@ Write-Host "msys64 dir:   $Msys64Dir  (portable QEMU lives here)"
 Write-Host "vm dir:       $VmDir"
 Write-Host ""
 
-New-Item -ItemType Directory -Force -Path $VmDir, $CacheDir | Out-Null
-
-function Sync-Repo {
-    # Clone-or-update a git repo at Dest, checked out at Ref. Duplicated from
-    # install-sirepo.ps1 -- both backends need the source on the Windows side.
-    # TODO: factor into common.psm1 if a third caller appears.
-    param([string]$Url, [string]$Dest, [string]$Ref)
-    if (-not (Test-Path $Dest)) {
-        Write-Host "Cloning $Url -> $Dest"
-        & git clone --depth 50 $Url $Dest
-        if ($LASTEXITCODE -ne 0) { throw "git clone failed for $Url" }
-    } else {
-        Write-Host "$Dest exists; fetching..."
-        Push-Location $Dest
-        try {
-            & git fetch --depth 50 origin
-            if ($LASTEXITCODE -ne 0) { throw "git fetch failed in $Dest" }
-        } finally { Pop-Location }
-    }
-    Push-Location $Dest
-    try {
-        & git checkout $Ref 2>&1 | Out-Host
-        if ($LASTEXITCODE -ne 0) { throw "git checkout $Ref failed in $Dest" }
-    } finally { Pop-Location }
-}
+New-Item -ItemType Directory -Force -Path $VmDir, $CacheDir, $RunsHost | Out-Null
 
 # --- 1. Bootstrap MSYS2 (portable, no admin) ---
 if (-not (Test-Path $BootstrapMarker)) {
@@ -222,24 +208,28 @@ if ((Test-Path $OverlayImage) -and -not $Force) {
     if ($LASTEXITCODE -ne 0) { throw "qemu-img create failed" }
 }
 
-# --- 5. Ensure sirepo + pykern source on Windows side ---
-# The VM mounts the project tree over WebDAV (see step 6) and pip installs
-# Sirepo from /mnt/host-src/sirepo. Source has to exist before the VM tries
-# to read it.
-Write-Host ""
-Write-Host "--- Syncing sirepo + pykern source on Windows side ---"
-Sync-Repo -Url 'https://github.com/radiasoft/pykern.git' -Dest $PykernDir -Ref $PykernRef
-Sync-Repo -Url 'https://github.com/radiasoft/sirepo.git' -Dest $SirepoDir -Ref $SirepoRef
-
-# --- 6. Build cloud-init seed ISO via IMAPI2 COM (Windows built-in) ---
-# user-data tells the VM to:
-#   1. apt install davfs2 + cifs-utils (cifs as fallback)
-#   2. configure davfs2 to do anonymous Basic auth, no locks, no caching
-#   3. mount $WebdavGuestUrl at /mnt/host-src
-#   4. run install-sirepo.sh out of the mounted source tree (editable install)
-# install-sirepo.sh is no longer embedded -- it comes through the mount.
+# --- 5. Build cloud-init seed ISO via IMAPI2 COM (Windows built-in) ---
+# Cloud-init writes install-sirepo.sh, the windows_native job-driver patch,
+# the sirepo.service unit, and a small mount-host-runs.sh helper into the
+# VM. Then runcmd: install davfs2 + git, git clone sirepo+pykern to /opt,
+# mount the WebDAV runs share at /mnt/host-runs (added to fstab so it
+# persists across reboots), invoke install-sirepo.sh with --patches.
+# Sirepo lives ENTIRELY inside the VM on local ext4 -- no davfs2 symlink
+# limitations on the source tree. /mnt/host-runs is a narrow data pipe for
+# the windows_native job driver to hand SRW jobs off to the worker.
 Write-Host ""
 Write-Host "--- Generating cloud-init seed ISO ---"
+
+# Inline install-sirepo.sh (~80 lines) and the job-driver patch (~60 lines)
+# into the YAML write_files. Force LF endings + indent for cloud-init's
+# multi-line content: | block.
+$installShContent = (Get-Content -Raw $InstallShHost) -replace "`r",''
+$indentedShContent = ($installShContent -split "`n" | ForEach-Object { '      ' + $_ }) -join "`n"
+
+$patchHost = Join-Path $PatchesHost 'job_driver_windows_native.py'
+if (-not (Test-Path $patchHost)) { throw "Missing patch $patchHost" }
+$patchContent = (Get-Content -Raw $patchHost) -replace "`r",''
+$indentedPatchContent = ($patchContent -split "`n" | ForEach-Object { '      ' + $_ }) -join "`n"
 
 $userData = @"
 #cloud-config
@@ -255,62 +245,85 @@ users:
     plain_text_passwd: sirepo
 
 write_files:
+  - path: /usr/local/bin/install-sirepo.sh
+    permissions: '0755'
+    content: |
+$indentedShContent
+  - path: /tmp/patches/job_driver_windows_native.py
+    permissions: '0644'
+    content: |
+$indentedPatchContent
   - path: /etc/systemd/system/sirepo.service
     permissions: '0644'
     content: |
       [Unit]
       Description=Sirepo (SRW)
-      After=network-online.target host-src.mount
-      Wants=network-online.target host-src.mount
+      After=network-online.target
+      Wants=network-online.target
+      RequiresMountsFor=/mnt/host-runs
 
       [Service]
       Type=simple
       Environment=SIREPO_FEATURE_CONFIG_TRUST_SH_ENV=1
       Environment=SIREPO_FEATURE_CONFIG_SIM_TYPES=srw
+      # Disable the Vue dev server: it only matters for cortex (not SRW), and
+      # vite requires Node 18+ -- Ubuntu 22.04 ships Node 12 and ships nothing
+      # newer in the default repos. Empty value -> _start_vue_server is a no-op.
+      Environment=SIREPO_FEATURE_CONFIG_VUE_SIM_TYPES=
+      Environment=SIREPO_JOB_DRIVER_MODULES=local:windows_native
+      Environment=SIREPO_JOB_DRIVER_WINDOWS_NATIVE_WORKER_URL=http://10.0.2.2:$WorkerPort
       Environment=PATH=/opt/sirepo-venv/bin:/usr/local/bin:/usr/bin:/bin
-      WorkingDirectory=/var/sirepo
-      ExecStartPre=/bin/mkdir -p /var/sirepo
+      # systemd creates /var/lib/sirepo + chmods/chowns it automatically. Using
+      # StateDirectory avoids the chicken-and-egg where WorkingDirectory applies
+      # to ExecStartPre too, so an ExecStartPre=mkdir would never get to run.
+      StateDirectory=sirepo
+      WorkingDirectory=/var/lib/sirepo
       ExecStart=/opt/sirepo-venv/bin/sirepo service http
       Restart=on-failure
       RestartSec=5
 
       [Install]
       WantedBy=multi-user.target
-  - path: /usr/local/sbin/mount-host-src.sh
+  - path: /usr/local/sbin/mount-host-runs.sh
     permissions: '0755'
     content: |
       #!/bin/bash
       set -euo pipefail
-      mkdir -p /mnt/host-src
-      # Configure davfs2: anonymous Basic auth, no client-side cache, no
-      # locks (wsgidav supports locks but we don't need them and they slow
-      # down editable installs).
+      mkdir -p /mnt/host-runs
+      # Anonymous Basic auth (worker accepts any creds); no client-side cache
+      # so writes from Sirepo are immediately visible to the worker.
       echo '$WebdavGuestUrl guest guest' > /etc/davfs2/secrets
       chmod 600 /etc/davfs2/secrets
       sed -i 's|^# *ask_auth .*|ask_auth 0|' /etc/davfs2/davfs2.conf
       sed -i 's|^# *use_locks .*|use_locks 0|' /etc/davfs2/davfs2.conf
       sed -i 's|^# *gui_optimize .*|gui_optimize 0|' /etc/davfs2/davfs2.conf
+      # Add to fstab so systemd auto-mounts on subsequent boots. The mount unit
+      # systemd auto-generates from fstab is what sirepo.service's
+      # RequiresMountsFor=/mnt/host-runs hooks into.
+      grep -q '/mnt/host-runs' /etc/fstab || echo '$WebdavGuestUrl /mnt/host-runs davfs rw,_netdev,user 0 0' >> /etc/fstab
+      systemctl daemon-reload
       # Retry briefly in case the worker isn't yet up when cloud-init runs.
       for i in 1 2 3 4 5; do
-          if mount -t davfs -o rw,_netdev $WebdavGuestUrl /mnt/host-src; then
-              echo "host-src mounted"; exit 0
+          if mount /mnt/host-runs; then
+              echo "host-runs mounted"; exit 0
           fi
           echo "mount attempt `$i failed; sleeping"
           sleep 5
       done
-      echo "ERROR: could not mount $WebdavGuestUrl after 5 tries" >&2
+      echo "ERROR: could not mount /mnt/host-runs after 5 tries" >&2
       exit 1
 
 runcmd:
-  # IMPORTANT: install davfs2 FIRST so its conffiles (incl. /etc/davfs2/secrets)
-  # land on disk before mount-host-src.sh overwrites them. Writing them via
-  # cloud-init write_files (which runs before runcmd) trips a dpkg conffile
-  # prompt that even DEBIAN_FRONTEND=noninteractive doesn't suppress, and the
-  # package's --configure step exits non-zero.
+  # IMPORTANT: install davfs2 FIRST so its conffiles land on disk before
+  # mount-host-runs.sh writes /etc/davfs2/secrets. Writing it via write_files
+  # (which runs before runcmd) trips a dpkg conffile prompt that
+  # DEBIAN_FRONTEND=noninteractive doesn't suppress.
   - apt-get update -qq
-  - DEBIAN_FRONTEND=noninteractive apt-get install -y davfs2
-  - /usr/local/sbin/mount-host-src.sh
-  - bash /mnt/host-src/scripts/install-sirepo.sh --patches /mnt/host-src/sirepo_patches /mnt/host-src/sirepo /mnt/host-src/pykern
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y davfs2 git
+  - /usr/local/sbin/mount-host-runs.sh
+  - git clone --depth 50 https://github.com/radiasoft/pykern.git /opt/pykern
+  - git clone --depth 50 https://github.com/radiasoft/sirepo.git /opt/sirepo
+  - bash /usr/local/bin/install-sirepo.sh --patches /tmp/patches /opt/sirepo /opt/pykern
   - systemctl daemon-reload
   - systemctl enable --now sirepo.service
 "@

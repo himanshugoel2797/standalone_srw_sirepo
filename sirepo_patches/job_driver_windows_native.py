@@ -15,8 +15,8 @@ How to enable:
   # 10.0.2.2 = QEMU slirp host. For WSL2:
   #   $(ip route show default | awk '/^default/{print $3}')
 
-Host-discovery is left to the launcher (run-sirepo.sh in the Linux env reads
-the active backend marker and exports the right URL before invoking sirepo).
+QEMU backend sets these in sirepo.service (cloud-init); WSL2 backend's
+run-sirepo.sh sets them before invoking sirepo.
 
 :copyright: Copyright (c) 2026 RadiaSoft LLC.  All Rights Reserved.
 :license: http://www.apache.org/licenses/LICENSE-2.0.html

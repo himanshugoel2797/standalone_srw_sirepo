@@ -6,10 +6,13 @@ Receives compute jobs from the Sirepo job supervisor inside the Linux backend
 srwpy. The point is to dodge the 10-50x TCG slowdown for QEMU users and to
 keep the WSL2 /mnt/c filesystem out of the hot loop.
 
-Also serves the project tree to the QEMU VM via WebDAV under /dav/, so a
-QEMU guest with no Windows-side virtfs can still get an editable Sirepo
-install. The VM mounts http://10.0.2.2:<port>/dav/ via davfs2 at boot.
-WSL2 has /mnt/c directly so doesn't need the /dav route.
+Also serves <project>/state/runs/ to the QEMU VM via WebDAV under /dav/.
+This is the narrow data pipe between Sirepo (running inside the VM with its
+source at /opt/sirepo) and this worker (running natively on Windows): Sirepo
+writes a job's run.py + inputs into /mnt/host-runs/<jid>/ inside the guest;
+the worker reads them back from <project>/state/runs/<jid>/ on the host and
+executes natively. The VM mounts http://10.0.2.2:<port>/dav/ via davfs2 at
+boot. WSL2 has /mnt/c directly so doesn't need the /dav route.
 
 Endpoints
 ---------
@@ -20,7 +23,7 @@ GET /health
 POST /run
     Execute a command in a run dir on the native Windows side. Body:
         {
-          "run_dir":   "/mnt/c/Users/.../runs/srw/<jid>",   # Linux path
+          "run_dir":   "/mnt/host-runs/<jid>",              # Linux path
           "cmd":       ["python", "run.py"],                # argv; first
                                                             # element "python"
                                                             # is rewritten to
@@ -32,30 +35,28 @@ POST /run
           "returncode": 0,
           "stdout":     "...",
           "stderr":     "...",
-          "run_dir_win":"C:\\Users\\...\\runs\\srw\\<jid>",
+          "run_dir_win":"C:\\...\\state\\runs\\<jid>",
           "duration_s": 1.42
         }
 
 /dav/...
-    WebDAV view of WEBDAV_ROOT (defaults to the project root -- the parent
-    of worker/). Read/write so `pip install -e` from the VM can land its
-    *.egg-info on the Windows side. Anonymous auth (loopback-only exposure).
+    WebDAV view of WEBDAV_ROOT (defaults to <project>/state/runs).
+    Anonymous auth (loopback-only exposure).
 
 The driver in the Linux env hands us a Linux path; we translate it to a
 Windows path via the WORKER_PATH_MAP env var (linux_prefix=windows_prefix
-pairs, comma-separated). Default map: /mnt/c -> C:\. The QEMU mount adds
-/mnt/host-src -> <project root> automatically (see scripts/run-worker.ps1).
+pairs, comma-separated). Default map: /mnt/host-runs -> <state/runs>, plus
+/mnt/<drive> -> <DRIVE>:\\ for the WSL2 case.
 """
 from __future__ import annotations
 
 import argparse
 import os
 import platform
-import shutil
 import subprocess
 import sys
 import time
-from pathlib import Path, PureWindowsPath
+from pathlib import PureWindowsPath
 from typing import Any
 
 import uvicorn
@@ -74,10 +75,29 @@ except Exception as e:
     _SRWPY_INFO = {"loaded": False, "error": f"{type(e).__name__}: {e}"}
 
 
-# Path translation. Default maps Linux /mnt/<drive>/<rest> to <DRIVE>:\<rest>.
+# WebDAV view: narrow purpose. Just the run-dir tree shared between Sirepo
+# (running in the Linux backend) and this worker (running on Windows). Sirepo
+# writes a job's run.py + inputs into a run dir; the worker reads them via the
+# host-side path and writes results back. Default is <project>/state/runs.
+# Sirepo source lives inside the VM (cloned by cloud-init), not over WebDAV.
+WEBDAV_ROOT = os.path.abspath(
+    os.environ.get("WEBDAV_ROOT")
+    or os.path.join(os.path.dirname(__file__), "..", "state", "runs")
+)
+os.makedirs(WEBDAV_ROOT, exist_ok=True)
+
+
+WEBDAV_MOUNT = "/dav"
+
+
+# Path translation. Default maps:
+#   /mnt/host-runs/...     -> WEBDAV_ROOT/...    (QEMU backend's narrow share)
+#   /mnt/<drive>/<rest>    -> <DRIVE>:\<rest>    (WSL2 backend's /mnt/c style)
 # Override with WORKER_PATH_MAP="<linux>=<windows>,<linux>=<windows>".
 def _default_path_map() -> list[tuple[str, str]]:
-    return [(f"/mnt/{c}", f"{c.upper()}:\\") for c in "abcdefghijklmnopqrstuvwxyz"]
+    return [
+        ("/mnt/host-runs", WEBDAV_ROOT),
+    ] + [(f"/mnt/{c}", f"{c.upper()}:\\") for c in "abcdefghijklmnopqrstuvwxyz"]
 
 
 def _parse_path_map(raw: str | None) -> list[tuple[str, str]]:
@@ -117,17 +137,6 @@ def translate_path(linux_path: str) -> str:
 
 app = FastAPI(title="Sirepo_Win native worker", version="0.3.0")
 _started_at = time.time()
-
-
-# WebDAV view of the project tree (defaults to parent of worker/, i.e. the
-# Sirepo_Win project root). Mounted under /dav in the FastAPI app so a single
-# Python process handles both /run and /dav.
-WEBDAV_ROOT = os.path.abspath(
-    os.environ.get("WEBDAV_ROOT") or os.path.join(os.path.dirname(__file__), "..")
-)
-
-
-WEBDAV_MOUNT = "/dav"
 
 
 def _build_webdav_app() -> WsgiDAVApp:
