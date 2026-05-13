@@ -5,6 +5,7 @@
 /sirepo/
 /pykern/
 /wsl/
+/qemu-vm/
 
 # Download cache + extractor tools fetched at bootstrap time.
 /.cache/
