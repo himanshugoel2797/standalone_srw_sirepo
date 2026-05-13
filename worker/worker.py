@@ -127,16 +127,26 @@ WEBDAV_ROOT = os.path.abspath(
 )
 
 
+WEBDAV_MOUNT = "/dav"
+
+
 def _build_webdav_app() -> WsgiDAVApp:
-    """Anonymous, read-write WebDAV exposing WEBDAV_ROOT at /dav/.
+    """Anonymous, read-write WebDAV exposing WEBDAV_ROOT at WEBDAV_MOUNT.
 
     Anonymous because we bind 127.0.0.1; QEMU slirp NATs 10.0.2.2->host so the
     guest reaches us without auth. Read-write so `pip install -e` can write
     *.egg-info back into the Windows source tree from inside the VM.
+
+    `mount_path` is critical: without it, wsgidav generates PROPFIND <href>
+    entries relative to its own root ("/scripts/...") instead of the
+    FastAPI-mounted prefix ("/dav/scripts/..."), and davfs2 in the VM tries
+    to follow those bare paths, gets 404 from FastAPI, and concludes the
+    directory doesn't exist.
     """
     config = {
         "host": "0.0.0.0",  # ignored when mounted as sub-app
         "port": 0,
+        "mount_path": WEBDAV_MOUNT,
         "provider_mapping": {"/": WEBDAV_ROOT},
         "http_authenticator": {
             "domain_controller": None,  # use simple_dc below
@@ -154,7 +164,7 @@ def _build_webdav_app() -> WsgiDAVApp:
     return WsgiDAVApp(config)
 
 
-app.mount("/dav", WSGIMiddleware(_build_webdav_app()))
+app.mount(WEBDAV_MOUNT, WSGIMiddleware(_build_webdav_app()))
 
 
 class RunRequest(BaseModel):

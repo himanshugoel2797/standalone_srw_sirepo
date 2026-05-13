@@ -276,18 +276,17 @@ write_files:
 
       [Install]
       WantedBy=multi-user.target
-  - path: /etc/davfs2/secrets
-    permissions: '0600'
-    content: |
-      $WebdavGuestUrl guest guest
   - path: /usr/local/sbin/mount-host-src.sh
     permissions: '0755'
     content: |
       #!/bin/bash
       set -euo pipefail
       mkdir -p /mnt/host-src
-      # Quiet davfs2 prompts; allow anonymous; disable client-side caching so
-      # Windows-side edits land instantly.
+      # Configure davfs2: anonymous Basic auth, no client-side cache, no
+      # locks (wsgidav supports locks but we don't need them and they slow
+      # down editable installs).
+      echo '$WebdavGuestUrl guest guest' > /etc/davfs2/secrets
+      chmod 600 /etc/davfs2/secrets
       sed -i 's|^# *ask_auth .*|ask_auth 0|' /etc/davfs2/davfs2.conf
       sed -i 's|^# *use_locks .*|use_locks 0|' /etc/davfs2/davfs2.conf
       sed -i 's|^# *gui_optimize .*|gui_optimize 0|' /etc/davfs2/davfs2.conf
@@ -303,6 +302,11 @@ write_files:
       exit 1
 
 runcmd:
+  # IMPORTANT: install davfs2 FIRST so its conffiles (incl. /etc/davfs2/secrets)
+  # land on disk before mount-host-src.sh overwrites them. Writing them via
+  # cloud-init write_files (which runs before runcmd) trips a dpkg conffile
+  # prompt that even DEBIAN_FRONTEND=noninteractive doesn't suppress, and the
+  # package's --configure step exits non-zero.
   - apt-get update -qq
   - DEBIAN_FRONTEND=noninteractive apt-get install -y davfs2
   - /usr/local/sbin/mount-host-src.sh
