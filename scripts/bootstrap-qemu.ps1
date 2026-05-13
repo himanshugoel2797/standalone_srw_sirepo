@@ -415,7 +415,7 @@ if ($NoStart) {
     Write-Host "(serves /run + /dav over WebDAV at port $WorkerPort):"
     Write-Host "  & '$ProjectRoot\python-native\python.exe' '$ProjectRoot\worker\worker.py' --port $WorkerPort"
     Write-Host "Then launch QEMU:"
-    Write-Host "  $QemuExe -m ${Memory}G -smp $Cpus -drive file=$OverlayImage,format=qcow2,if=virtio -drive file=$SeedIso,format=raw,media=cdrom -netdev user,id=net0,hostfwd=tcp::${HostPort}-:8000 -device virtio-net,netdev=net0 -nographic"
+    Write-Host "  $QemuExe -accel whpx -accel tcg,thread=multi,tb-size=512 -m ${Memory}G -smp $Cpus -drive file=$OverlayImage,format=qcow2,if=virtio -drive file=$SeedIso,format=raw,media=cdrom -netdev user,id=net0,hostfwd=tcp::${HostPort}-:8000 -device virtio-net,netdev=net0 -nographic"
     exit 0
 }
 
@@ -445,16 +445,45 @@ try {
     throw "Worker not running."
 }
 
-# --- 8. Launch QEMU ---
+# --- 8. Detect accelerator availability for user-visible messaging ---
+# QEMU itself does the actual fallback via chained -accel flags; this is just
+# so the user knows what to expect timing-wise. WHPX needs no admin to USE,
+# but the underlying feature needs admin to ENABLE -- so we check rather than
+# offering to enable it.
+$whpxAvailable = $false
+$vmcompute = Get-Service -Name vmcompute -ErrorAction SilentlyContinue
+if ($vmcompute) {
+    # vmcompute (Hyper-V Host Compute Service) being present is a strong
+    # signal the WHPX feature is enabled (it's installed with the feature).
+    $whpxAvailable = $true
+}
+
 Write-Host ""
-Write-Host "=== Launching QEMU (TCG, software emulation) ==="
-Write-Host "First boot is SLOW under TCG: ~5-15 min to boot Ubuntu, +10-20 min for cloud-init to install Sirepo."
-Write-Host "Subsequent boots: ~5 min."
+Write-Host "=== Launching QEMU ==="
+if ($whpxAvailable) {
+    Write-Host "Accelerator: WHPX (Windows Hypervisor Platform) detected; will be tried first." -ForegroundColor Green
+    Write-Host "Expected install time: ~5-10 min (near-native CPU speed)."
+} else {
+    Write-Host "Accelerator: WHPX not available; falling back to TCG (software emulation)." -ForegroundColor Yellow
+    Write-Host "Expected install time: ~20-30 min. To make this faster, enable the Windows"
+    Write-Host "Hypervisor Platform feature (admin/UAC needed once):"
+    Write-Host "  Settings > Programs > Windows Features > Windows Hypervisor Platform"
+}
 Write-Host ""
 Write-Host "Once cloud-init finishes, Sirepo will be at http://localhost:$HostPort"
 Write-Host ""
 
 $qemuArgs = @(
+    # Try WHPX (Windows Hypervisor Platform) first -- runs guest code on the
+    # CPU via Windows' user-mode hypervisor API, ~1.5x of native vs TCG's
+    # 3-10x slower-than-native. Requires the "Windows Hypervisor Platform"
+    # optional feature to be enabled (usually already on if user has Docker
+    # Desktop, WSL2, or Hyper-V). If WHPX init fails, QEMU falls through to
+    # the next -accel automatically. TCG flags: thread=multi exploits
+    # multiple host cores for translation; tb-size=512 grows the translated-
+    # block cache (saves re-translation overhead on long-running guests).
+    '-accel', 'whpx',
+    '-accel', 'tcg,thread=multi,tb-size=512',
     '-m', "${Memory}G",
     '-smp', "$Cpus",
     '-drive', "file=$OverlayImage,format=qcow2,if=virtio",
