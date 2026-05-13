@@ -1,0 +1,17 @@
+# Portable installs — bulky, reproducible from scripts, never committed.
+/msys64/
+/python-native/
+/msmpi/
+/sirepo/
+
+# Download cache + extractor tools fetched at bootstrap time.
+/.cache/
+
+# Mutable runtime state (sirepo db, logs, sessions, sims).
+/state/
+
+# Editor / OS noise.
+*.swp
+*.bak
+.DS_Store
+Thumbs.db
