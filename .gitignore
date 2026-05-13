@@ -3,6 +3,7 @@
 /python-native/
 /msmpi/
 /sirepo/
+/pykern/
 
 # Download cache + extractor tools fetched at bootstrap time.
 /.cache/
