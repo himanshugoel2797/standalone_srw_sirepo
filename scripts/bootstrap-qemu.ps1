@@ -617,21 +617,33 @@ $qemuArgs = @(
     '-netdev', "user,id=net0,hostfwd=tcp::${HostPort}-:8000,hostfwd=tcp::${ControlPort}-:${ControlPort}",
     '-device', 'virtio-net,netdev=net0',
     '-L', $QemuShareDir,
-    '-nographic'
+    '-display', 'none'
 )
 
+$qemuLog = Join-Path $CacheDir 'qemu.log'
+
 if ($Detached) {
-    # Background launch: redirect QEMU stdout/stderr to a log file so the
-    # console output of the boot sequence is preserved without taking over
-    # the terminal. Caller (setup.ps1) keeps the process handle and is
-    # responsible for shutting it down.
-    $qemuLog = Join-Path $CacheDir 'qemu.log'
-    Write-Host "QEMU log: $qemuLog"
-    $qemuProc = Start-Process -FilePath $QemuExe -ArgumentList $qemuArgs `
-        -RedirectStandardOutput $qemuLog -RedirectStandardError "$qemuLog.err" `
+    # Background launch: have QEMU open the serial log file directly via
+    # `-serial file:` instead of `-nographic` + stdout redirect.
+    #
+    # The stdout-redirect approach is broken under `Start-Process -WindowStyle
+    # Hidden`: the hidden child has no real console, so QEMU's serial->stdio
+    # writes get block-buffered (or silently dropped), and qemu.log stays
+    # empty for minutes while the guest boots invisibly. With `-serial file:`
+    # QEMU itself owns the fd, writes line-buffered, and the host-side log
+    # actually reflects guest boot state. Caller (setup.ps1) keeps the
+    # process handle and is responsible for shutting it down.
+    Write-Host "QEMU serial log: $qemuLog"
+    $qemuProc = Start-Process -FilePath $QemuExe `
+        -ArgumentList (@('-serial', "file:$qemuLog") + $qemuArgs) `
+        -RedirectStandardError "$qemuLog.err" `
         -WindowStyle Hidden -PassThru
     Write-Host "QEMU pid=$($qemuProc.Id) (detached)."
     return $qemuProc
 }
 
-& $QemuExe @qemuArgs
+# Foreground (-NoUi / direct invocation): route serial to stdio so the user
+# can see kernel boot messages in their terminal -- equivalent to the old
+# `-nographic`. This works in the foreground case because the parent shell
+# owns a real console.
+& $QemuExe @(@('-serial', 'stdio') + $qemuArgs)
