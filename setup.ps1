@@ -58,8 +58,9 @@ param(
     # file:/// URL or pass -QemuBundleUrl / -QemuBundleSha256. Env vars
     # SIREPO_WIN_QEMU_URL / SIREPO_WIN_QEMU_SHA256 also work.
     [string]$QemuBundleUrl    = $(if ($env:SIREPO_WIN_QEMU_URL) { $env:SIREPO_WIN_QEMU_URL }
-                                  else { 'https://github.com/dotnet00/Sirepo_Win/releases/download/qemu-portable-v11.0.0-r1/qemu-portable.zip' }),
-    [string]$QemuBundleSha256 = $(if ($env:SIREPO_WIN_QEMU_SHA256) { $env:SIREPO_WIN_QEMU_SHA256 } else { '' }),
+                                  else { 'https://github.com/himanshugoel2797/standalone_srw_sirepo/releases/download/qemu-portable-v11.0.0-r1/qemu-portable.zip' }),
+    [string]$QemuBundleSha256 = $(if ($env:SIREPO_WIN_QEMU_SHA256) { $env:SIREPO_WIN_QEMU_SHA256 }
+                                  else { '5d463141af73fad407703aedbb64d45a4fa376bc7786e42a67e09fe859fd48c2' }),
     [switch]$NoUi,
     [switch]$Force
 )
@@ -257,6 +258,22 @@ $timer          = New-Object System.Windows.Forms.Timer
 $timer.Interval = 5000
 $state          = @{ SirepoUp = $false; ControlUp = $false; SirepoRev = ''; PykernRev = '' }
 
+$state.LastStage = ''
+$stageLabel = @{
+    'starting'             = 'Starting...'
+    'apt-deps'             = 'Installing davfs2 + git...'
+    'clone-pykern'         = 'Cloning pykern from GitHub...'
+    'clone-sirepo'         = 'Cloning Sirepo from GitHub...'
+    'apt-install'          = 'Installing apt runtime packages...'
+    'pip-upgrade'          = 'Upgrading pip + setuptools...'
+    'pip-install-pykern'   = 'Installing pykern (~50 wheels from PyPI)...'
+    'pip-install-sirepo'   = 'Installing Sirepo (~50 wheels from PyPI)...'
+    'patches'              = 'Applying Sirepo_Win patches...'
+    'smoke-test'           = 'Smoke-testing the install...'
+    'install'              = 'Installing (unspecified stage)...'
+    'done'                 = 'Install complete, starting Sirepo...'
+}
+
 $timer.Add_Tick({
     # Sirepo HTTP probe (cheap; failure is the common case during boot).
     $sirepoUp = $false
@@ -265,9 +282,12 @@ $timer.Add_Tick({
         $sirepoUp = ($r.StatusCode -eq 200)
     } catch { }
 
-    # Control endpoint /status (also gives us git revs + sirepo.service active).
+    # Control endpoint /status (also gives us git revs + sirepo.service active
+    # + install_stage so we can show real progress, not "cloud-init in progress").
     $controlUp = $false
     $rev = ''
+    $stage = ''
+    $svcActive = ''
     try {
         $r = Invoke-WebRequest -Uri "$controlUrl/status" -UseBasicParsing -TimeoutSec 2
         $controlUp = ($r.StatusCode -eq 200)
@@ -275,11 +295,13 @@ $timer.Add_Tick({
             $body = if ($r.Content -is [byte[]]) { [Text.Encoding]::UTF8.GetString($r.Content) }
                     else { [string]$r.Content }
             $j = $body | ConvertFrom-Json
-            $rev = "{0}@{1}, pykern@{2}, svc={3}" -f 'sirepo', $j.sirepo_rev, $j.pykern_rev, $j.sirepo_active
+            $rev = "sirepo@{0}, pykern@{1}, svc={2}" -f $j.sirepo_rev, $j.pykern_rev, $j.sirepo_active
+            $stage = if ($j.PSObject.Properties.Name -contains 'install_stage') { [string]$j.install_stage } else { '' }
+            $svcActive = [string]$j.sirepo_active
         }
     } catch { }
 
-    # First-time transitions: log + enable buttons.
+    # First-time transitions.
     if ($sirepoUp -and -not $state.SirepoUp) {
         & $appendLog "Sirepo HTTP 200 -- ready"
         $btnOpen.Enabled = $true
@@ -289,16 +311,37 @@ $timer.Add_Tick({
         $btnOpen.Enabled = $false
     }
     if ($controlUp -and -not $state.ControlUp) {
-        & $appendLog "Control endpoint reachable: $rev"
-        $btnUpdate.Enabled = $true
+        & $appendLog "Control endpoint reachable"
+    }
+    # Only enable Update once the install reports "done" -- the endpoint is
+    # reachable earlier (it starts before install runs to report progress)
+    # but /update would race the original install.
+    $installDone = ($stage -eq 'done' -or $sirepoUp)
+    $btnUpdate.Enabled = $controlUp -and $installDone
+
+    # Log each new stage transition so the user sees a timeline.
+    if ($stage -and $stage -ne $state.LastStage) {
+        $msg = if ($stageLabel.ContainsKey($stage)) { $stageLabel[$stage] } else { "Stage: $stage" }
+        & $appendLog "[$stage] $msg"
+        $state.LastStage = $stage
     }
 
     $state.SirepoUp  = $sirepoUp
     $state.ControlUp = $controlUp
 
-    $sirepoLine = if ($sirepoUp) { "Sirepo: running at $sirepoUrl" }
-                  else           { 'Sirepo: starting (cloud-init in progress)' }
-    $revLine    = if ($controlUp) { $rev } else { 'control endpoint not yet reachable' }
+    $sirepoLine =
+        if ($sirepoUp) {
+            "Sirepo: running at $sirepoUrl"
+        } elseif ($controlUp -and $stage) {
+            $friendly = if ($stageLabel.ContainsKey($stage)) { $stageLabel[$stage] } else { $stage }
+            "Sirepo: installing -- $friendly"
+        } else {
+            'Sirepo: waiting for VM boot (kernel + cloud-init network stage)'
+        }
+    $revLine =
+        if ($sirepoUp -or $svcActive -eq 'active') { $rev }
+        elseif ($controlUp) { "service: $svcActive" }
+        else { '(control endpoint not yet reachable)' }
     $status.Text = "$sirepoLine`r`n$revLine"
 }.GetNewClosure())
 $timer.Start()

@@ -46,11 +46,28 @@ def service_state(name):
     return r.stdout.strip() or "unknown"
 
 
+STAGE_FILE = "/var/lib/sirepo/install-stage"
+
+
+def install_stage():
+    # Written by cloud-init's runcmd + install-sirepo.sh as the install
+    # progresses through clone-pykern -> clone-sirepo -> apt-install ->
+    # pip-install-pykern -> pip-install-sirepo -> patches -> smoke-test ->
+    # starting -> done. The host-side UI shows this so the user sees
+    # actual progress past "cloud-init in progress".
+    try:
+        with open(STAGE_FILE) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return "starting"
+
+
 def status():
     return {
         "sirepo_rev":     git_rev("/opt/sirepo"),
         "pykern_rev":     git_rev("/opt/pykern"),
         "sirepo_active":  service_state(SIREPO_SVC),
+        "install_stage":  install_stage(),
     }
 
 

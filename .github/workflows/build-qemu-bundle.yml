@@ -34,7 +34,28 @@ jobs:
         with:
           msystem: MINGW64
           install: mingw-w64-x86_64-qemu
-          update: false
+          # update: true is critical -- without it, setup-msys2 installs from
+          # the runner-image-cached MSYS2 snapshot, which can be MONTHS behind
+          # the live mirror. We hit this once (runner cached qemu 10.2.2 even
+          # though MSYS2 had 11.0.0-2 live), and the older qemu was buggy
+          # under WHPX (SIGILL in git's HTTPS crypto path). update: true
+          # forces `pacman -Syu` to sync against the live repo before install.
+          update: true
+
+      - name: Sanity-check QEMU version (fail loudly on regression)
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          ver="$(pacman -Q mingw-w64-x86_64-qemu | awk '{print $2}')"
+          echo "Installed: mingw-w64-x86_64-qemu $ver"
+          case "$ver" in
+            11.*|12.*|13.*|14.*) ;;   # known-good major versions
+            *)
+              echo "ERROR: unexpected QEMU version $ver -- refusing to publish." >&2
+              echo "If MSYS2 has moved on past v14, bump this check." >&2
+              exit 1
+              ;;
+          esac
 
       - name: Stage portable bundle (x86_64 only)
         shell: msys2 {0}

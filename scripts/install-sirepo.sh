@@ -15,6 +15,14 @@
 
 set -euo pipefail
 
+# Stage marker -- sirepo-control.service's /status reads this and the UI shows
+# it as "Installing: <stage>" so users see progress past "cloud-init started".
+STAGE_FILE=/var/lib/sirepo/install-stage
+stage() {
+    mkdir -p /var/lib/sirepo
+    echo "$1" > "$STAGE_FILE"
+}
+
 FORCE=0
 PATCHES_DIR=""
 
@@ -49,16 +57,17 @@ for d in "$SIREPO_SRC" "$PYKERN_SRC"; do
     fi
 done
 
-echo "--- apt update + install base packages ---"
-apt-get update -qq
+stage apt-install
+echo "--- apt install runtime packages ---"
+# Stripped to runtime-only: sirepo/pykern's deps all ship as manylinux x86_64
+# wheels, so we don't need build-essential or any -dev headers. Without
+# compilation we also don't need nodejs/npm here (vue UI is disabled via
+# SIREPO_FEATURE_CONFIG_VUE_SIM_TYPES=). davfs2 + git are installed in
+# cloud-init's runcmd already; this list only adds what's left.
+# Saves ~30-40s on first boot and ~250 MB of overlay growth.
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv python3-dev \
-    git build-essential pkg-config \
-    libffi-dev libssl-dev libxml2-dev libxslt1-dev \
-    libjpeg-dev libpng-dev libfreetype-dev libtiff-dev libwebp-dev \
-    zlib1g-dev libldap2-dev libsasl2-dev libldap-common \
-    nodejs npm \
-    curl ca-certificates
+    python3 python3-pip python3-venv \
+    ca-certificates
 
 VENV=/opt/sirepo-venv
 if (( FORCE )) && [[ -d "$VENV" ]]; then
@@ -74,14 +83,19 @@ fi
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
 
+stage pip-upgrade
 echo "--- upgrade pip + install pykern (editable) ---"
 pip install --upgrade pip wheel setuptools
+
+stage pip-install-pykern
 pip install -e "$PYKERN_SRC"
 
+stage pip-install-sirepo
 echo "--- install sirepo (editable; pulls remaining deps) ---"
 pip install -e "$SIREPO_SRC"
 
 if [[ -n "$PATCHES_DIR" ]]; then
+    stage patches
     if [[ ! -d "$PATCHES_DIR" ]]; then
         echo "--patches dir not found: $PATCHES_DIR" >&2
         exit 1
@@ -97,6 +111,7 @@ if [[ -n "$PATCHES_DIR" ]]; then
     done
 fi
 
+stage smoke-test
 echo "--- smoke test ---"
 which sirepo
 python -c 'import sirepo, pykern; print("OK: sirepo + pykern importable")'

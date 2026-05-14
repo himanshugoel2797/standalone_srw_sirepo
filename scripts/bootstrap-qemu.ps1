@@ -387,12 +387,33 @@ runcmd:
   - apt-get update -qq
   - DEBIAN_FRONTEND=noninteractive apt-get install -y davfs2 git
   - /usr/local/sbin/mount-host-runs.sh
-  - git clone --depth 50 https://github.com/radiasoft/pykern.git /opt/pykern
-  - git clone --depth 50 https://github.com/radiasoft/sirepo.git /opt/sirepo
-  - bash /usr/local/bin/install-sirepo.sh --patches /tmp/patches /opt/sirepo /opt/pykern
+  # Start sirepo-control.service early so the host-side UI's /status poll can
+  # report "installing..." while the long-running steps below execute.
   - systemctl daemon-reload
+  - mkdir -p /var/lib/sirepo
+  - echo apt-deps > /var/lib/sirepo/install-stage
   - systemctl enable --now sirepo-control.service
-  - systemctl enable --now sirepo.service
+  # Chain git clones + install + enable in a SINGLE bash -c with set -e so any
+  # failure short-circuits and sirepo.service does NOT get enabled. Without
+  # this, cloud-init treats each runcmd entry independently: a git failure
+  # leaves /opt/sirepo missing, install-sirepo.sh bails, but
+  # `systemctl enable --now sirepo.service` still runs -- and the service
+  # then sits in a Restart=on-failure loop forever, with /status reporting
+  # `sirepo_active: activating` and no way to tell anything is wrong.
+  - |
+    bash -c '
+      set -euo pipefail
+      stage() { echo "$1" > /var/lib/sirepo/install-stage; }
+      stage clone-pykern
+      git clone --depth 50 https://github.com/radiasoft/pykern.git /opt/pykern
+      stage clone-sirepo
+      git clone --depth 50 https://github.com/radiasoft/sirepo.git /opt/sirepo
+      stage install
+      bash /usr/local/bin/install-sirepo.sh --patches /tmp/patches /opt/sirepo /opt/pykern
+      stage starting
+      systemctl enable --now sirepo.service
+      stage done
+    '
 "@
 
 $metaData = @"
@@ -564,6 +585,15 @@ $qemuArgs = @(
     # block cache (saves re-translation overhead on long-running guests).
     '-accel', 'whpx',
     '-accel', 'tcg,thread=multi,tb-size=512',
+    # -cpu max: expose every CPU feature the accelerator can pass through
+    # (AES-NI, AVX/AVX2, SHA-NI, etc.). The default `qemu64` model only
+    # advertises SSE2, which causes libraries with hand-rolled crypto SIMD
+    # (libcurl/libgnutls used by git-remote-https) to hit SIGILL on hosts
+    # where the runtime CPUID detection sees AES-NI on the underlying CPU
+    # but the trapped guest CPU can't execute it. Symptom: cloud-init's
+    # `git clone` dies with "git-remote-https died of signal 4" and the
+    # install silently fails.
+    '-cpu', 'max',
     '-m', "${Memory}G",
     '-smp', "$Cpus",
     '-drive', "file=$OverlayImage,format=qcow2,if=virtio",
