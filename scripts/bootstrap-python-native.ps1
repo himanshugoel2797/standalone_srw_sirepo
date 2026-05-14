@@ -48,6 +48,29 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# Reset PSModulePath under PS 5.1 so PS 7's modules can't shadow ours.
+# Without this, Get-FileHash and a handful of other Utility cmdlets silently
+# disappear via cross-version autoload contamination.
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    $env:PSModulePath = @(
+        Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'
+        Join-Path $env:SystemRoot   'system32\WindowsPowerShell\v1.0\Modules'
+    ) -join ';'
+}
+
+# Hash via .NET directly -- doesn't depend on Microsoft.PowerShell.Utility
+# being loadable. Same helper lives in bootstrap-qemu.ps1; duplicated here
+# rather than dot-sourced to keep this script standalone.
+function Get-FileHashHex {
+    param([string]$Path, [ValidateSet('MD5','SHA256','SHA512')] [string]$Algorithm = 'SHA256')
+    $hasher = [System.Security.Cryptography.HashAlgorithm]::Create($Algorithm)
+    try {
+        $fs = [System.IO.File]::OpenRead($Path)
+        try { $bytes = $hasher.ComputeHash($fs) } finally { $fs.Dispose() }
+    } finally { $hasher.Dispose() }
+    -join ($bytes | ForEach-Object { '{0:x2}' -f $_ })
+}
+
 # --- Paths (all project-local) ---
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $PyDir       = Join-Path $ProjectRoot 'python-native'
@@ -92,7 +115,7 @@ if (-not (Test-Path $ZipPath)) {
 }
 
 # --- 2. Verify MD5 ---
-$actual = (Get-FileHash $ZipPath -Algorithm MD5).Hash.ToLower()
+$actual = Get-FileHashHex -Path $ZipPath -Algorithm MD5
 if ($actual -ne $ExpectedMd5.ToLower()) {
     Remove-Item $ZipPath -Force
     throw "MD5 mismatch (expected $ExpectedMd5, got $actual). Cached file removed; re-run to retry."

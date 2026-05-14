@@ -89,17 +89,54 @@ param(
     # Launch QEMU as a detached background process (Start-Process -PassThru)
     # so the caller can keep running (e.g. setup.ps1's WinForms control UI).
     # In this mode the script returns the QEMU process; the caller owns cleanup.
-    [switch]$Detached
+    [switch]$Detached,
+    # Per-run log directory chosen by the orchestrator (setup.ps1). If unset,
+    # we fall back to a timestamped dir under .cache/runs/. Either way, this
+    # is where qemu.log / qemu.err land.
+    [string]$LogDir
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+# Same PSModulePath defensiveness as setup.ps1: PS 7's module dirs leak in
+# and break PS 5.1 cmdlet autoload (notably Get-FileHash).
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    $env:PSModulePath = @(
+        Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'
+        Join-Path $env:SystemRoot   'system32\WindowsPowerShell\v1.0\Modules'
+    ) -join ';'
+}
+
+# Hash a file via .NET directly instead of Get-FileHash. When PowerShell 7 is
+# installed system-wide, $env:PSModulePath inherits PS 7's module dirs FIRST,
+# and PS 5.1's autoload picks up PS 7's incompatible Microsoft.PowerShell.Utility
+# module -- after which Get-FileHash silently isn't exported. .NET's
+# System.Security.Cryptography is available in every PowerShell host without
+# any module load.
+function Get-FileHashHex {
+    param([string]$Path, [ValidateSet('SHA256','SHA512')] [string]$Algorithm = 'SHA256')
+    $hasher = [System.Security.Cryptography.HashAlgorithm]::Create($Algorithm)
+    try {
+        $fs = [System.IO.File]::OpenRead($Path)
+        try { $bytes = $hasher.ComputeHash($fs) } finally { $fs.Dispose() }
+    } finally { $hasher.Dispose() }
+    -join ($bytes | ForEach-Object { '{0:x2}' -f $_ })
+}
 
 # --- Paths (all project-local) ---
 $ProjectRoot   = Split-Path -Parent $PSScriptRoot
 $QemuDir       = Join-Path $ProjectRoot 'qemu'
 $VmDir         = Join-Path $ProjectRoot 'qemu-vm'
 $CacheDir      = Join-Path $ProjectRoot '.cache'
+
+# Resolve $LogDir: caller (setup.ps1) typically passes one; standalone
+# invocations get a fresh timestamped dir under .cache/runs/. Either way
+# qemu.log / qemu.err land here.
+if (-not $LogDir) {
+    $LogDir = Join-Path $ProjectRoot (".cache\runs\{0}" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+}
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
 $QemuReadyMarker = Join-Path $QemuDir '.qemu-ready'
 $VmReadyMarker   = Join-Path $VmDir '.vm-ready'
@@ -175,7 +212,7 @@ Bundle layout expected: zip with bin/qemu-system-x86_64.exe at top level.
     } finally { $ProgressPreference = $oldPP }
 
     if ($QemuBundleSha256) {
-        $actual = (Get-FileHash $bundleZip -Algorithm SHA256).Hash.ToLower()
+        $actual = Get-FileHashHex -Path $bundleZip -Algorithm SHA256
         $expected = $QemuBundleSha256.Trim().ToLower()
         if ($actual -ne $expected) {
             Remove-Item $bundleZip -Force
@@ -237,7 +274,7 @@ if (-not (Test-Path $baseQcowCache) -or $Force) {
     Write-Host "Cached: $baseQcowCache"
 }
 $expectedSha = Get-HashFromSums -Url $ChecksumsUrl -Filename $qcowFilename
-$actual = (Get-FileHash $baseQcowCache -Algorithm $ChecksumAlgorithm).Hash.ToLower()
+$actual = Get-FileHashHex -Path $baseQcowCache -Algorithm $ChecksumAlgorithm
 if ($actual -ne $expectedSha) {
     Remove-Item $baseQcowCache -Force
     throw "Base image $ChecksumAlgorithm mismatch (expected $expectedSha, got $actual). Cached file removed; re-run."
@@ -620,7 +657,8 @@ $qemuArgs = @(
     '-display', 'none'
 )
 
-$qemuLog = Join-Path $CacheDir 'qemu.log'
+$qemuLog    = Join-Path $LogDir 'qemu.log'
+$qemuErrLog = Join-Path $LogDir 'qemu.err'
 
 if ($Detached) {
     # Background launch: have QEMU open the serial log file directly via
@@ -634,9 +672,10 @@ if ($Detached) {
     # actually reflects guest boot state. Caller (setup.ps1) keeps the
     # process handle and is responsible for shutting it down.
     Write-Host "QEMU serial log: $qemuLog"
+    Write-Host "QEMU stderr:     $qemuErrLog"
     $qemuProc = Start-Process -FilePath $QemuExe `
         -ArgumentList (@('-serial', "file:$qemuLog") + $qemuArgs) `
-        -RedirectStandardError "$qemuLog.err" `
+        -RedirectStandardError $qemuErrLog `
         -WindowStyle Hidden -PassThru
     Write-Host "QEMU pid=$($qemuProc.Id) (detached)."
     return $qemuProc

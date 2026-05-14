@@ -68,16 +68,57 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$ProjectRoot = $PSScriptRoot
+# When PowerShell 7 is installed system-wide, its module dirs leak into
+# $env:PSModulePath ahead of PS 5.1's, and 5.1's autoload silently picks up
+# PS 7's incompatible modules (Get-FileHash disappears, etc.). Reset to the
+# pristine 5.1 set so we don't depend on which PS host launched us.
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    $env:PSModulePath = @(
+        Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'
+        Join-Path $env:SystemRoot   'system32\WindowsPowerShell\v1.0\Modules'
+    ) -join ';'
+}
+
+$ProjectRoot       = $PSScriptRoot
 $PyNativeBootstrap = Join-Path $ProjectRoot 'scripts\bootstrap-python-native.ps1'
 $QemuBootstrap     = Join-Path $ProjectRoot 'scripts\bootstrap-qemu.ps1'
 $WorkerPy          = Join-Path $ProjectRoot 'worker\worker.py'
 $PyExe             = Join-Path $ProjectRoot 'python-native\python.exe'
 $PyMarker          = Join-Path $ProjectRoot 'python-native\.python-native-ok'
-$WorkerLog         = Join-Path $ProjectRoot '.cache\worker.log'
+
+# All logs from a single run land in one folder so a user has exactly one
+# directory to share / inspect when something breaks. Path is fixed once
+# at script start and surfaced to the UI; the FormClosing handler also
+# writes a summary into it. The timestamp prevents file-lock collisions
+# with any orphaned file handles from prior crashed runs.
+$RunStamp     = Get-Date -Format 'yyyyMMdd-HHmmss'
+$LogDir       = Join-Path $ProjectRoot ".cache\runs\$RunStamp"
+$WorkerLog    = Join-Path $LogDir 'worker.log'
+$WorkerErrLog = Join-Path $LogDir 'worker.err'
+$SetupLog     = Join-Path $LogDir 'setup.log'
+
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+
+# Retain only the 5 most recent run dirs to keep .cache from growing
+# unbounded. Sort by name (timestamps are lexicographically ordered).
+Get-ChildItem (Split-Path $LogDir) -Directory -ErrorAction SilentlyContinue |
+    Sort-Object Name -Descending |
+    Select-Object -Skip 5 |
+    ForEach-Object {
+        try { Remove-Item $_.FullName -Recurse -Force -ErrorAction Stop }
+        catch { Write-Host "Could not prune old run dir $($_.FullName): $_" -ForegroundColor DarkGray }
+    }
+
+# Capture this script's own stdout/stderr into setup.log via Start-Transcript
+# so users have a single place to look. Stop-Transcript runs in the trap so
+# we don't lose output if we throw.
+try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch {}
+Start-Transcript -Path $SetupLog -Append -IncludeInvocationHeader | Out-Null
 
 Write-Host "=== Sirepo_Win setup ==="
-Write-Host "project root: $ProjectRoot"
+Write-Host "project root:  $ProjectRoot"
+Write-Host "log directory: $LogDir"
+Write-Host "  (worker.log, worker.err, qemu.log, qemu.err, setup.log)"
 Write-Host ""
 
 # --- 1. python-native (embeddable Python + srwpy + worker deps) ---
@@ -98,37 +139,21 @@ function Test-WorkerHealthy {
     } catch { return $false }
 }
 
-New-Item -ItemType Directory -Force -Path (Split-Path $WorkerLog) | Out-Null
-
 $workerProc = $null
 if (Test-WorkerHealthy) {
     Write-Host "Worker already running on 127.0.0.1:$WorkerPort."
 } else {
     Write-Host "--- Starting worker (logs -> $WorkerLog) ---"
-    # Start detached so Ctrl-C in this PowerShell doesn't take us out before
-    # we get to the cleanup at the bottom.
-    # Windows PowerShell 5.1's ProcessStartInfo (.NET Framework) doesn't have
-    # ArgumentList -- use Arguments as a single quoted string.
-    $psi = [System.Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName               = $PyExe
-    $psi.Arguments              = "`"$WorkerPy`" --port $WorkerPort"
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError  = $true
-    $psi.UseShellExecute        = $false
-    $psi.WorkingDirectory       = $ProjectRoot
-    $workerProc = [System.Diagnostics.Process]::Start($psi)
-    $sw = [System.IO.StreamWriter]::new($WorkerLog, $false)
-    $sw.AutoFlush = $true
-    $onData = {
-        param($s, $e)
-        if ($null -ne $e.Data) { $Event.MessageData.WriteLine($e.Data) }
-    }
-    Register-ObjectEvent -InputObject $workerProc -EventName OutputDataReceived `
-        -Action $onData -MessageData $sw | Out-Null
-    Register-ObjectEvent -InputObject $workerProc -EventName ErrorDataReceived `
-        -Action $onData -MessageData $sw | Out-Null
-    $workerProc.BeginOutputReadLine()
-    $workerProc.BeginErrorReadLine()
+    # Start-Process owns the redirect file handles itself; they close when
+    # the child exits. No StreamWriter, no Register-ObjectEvent, nothing
+    # this script can leak. -PassThru gives us back the process so the
+    # FormClosing handler can Kill() it.
+    $workerProc = Start-Process -FilePath $PyExe `
+        -ArgumentList @("`"$WorkerPy`"", '--port', "$WorkerPort") `
+        -WorkingDirectory $ProjectRoot `
+        -RedirectStandardOutput $WorkerLog `
+        -RedirectStandardError $WorkerErrLog `
+        -WindowStyle Hidden -PassThru
 
     Write-Host "Waiting for worker /health..."
     for ($i = 0; $i -lt 30; $i++) {
@@ -137,7 +162,8 @@ if (Test-WorkerHealthy) {
         if ($workerProc.HasExited) {
             Write-Host ""
             Write-Host "Worker exited early. Tail of ${WorkerLog}:" -ForegroundColor Red
-            if (Test-Path $WorkerLog) { Get-Content $WorkerLog -Tail 30 | Write-Host }
+            if (Test-Path $WorkerLog)    { Get-Content $WorkerLog    -Tail 30 | Write-Host }
+            if (Test-Path $WorkerErrLog) { Get-Content $WorkerErrLog -Tail 30 | Write-Host }
             throw "Worker failed to start."
         }
     }
@@ -155,10 +181,25 @@ $qemuArgs = @{
     HostPort    = $HostPort
     WorkerPort  = $WorkerPort
     ControlPort = $ControlPort
+    LogDir      = $LogDir
 }
 if ($QemuBundleUrl)    { $qemuArgs.QemuBundleUrl    = $QemuBundleUrl }
 if ($QemuBundleSha256) { $qemuArgs.QemuBundleSha256 = $QemuBundleSha256 }
 if ($Force)            { $qemuArgs.Force            = $true }
+
+# Helper: kill any process we started so a bootstrap failure doesn't leave
+# orphans (worker, partially-started QEMU) running in the background.
+# Idempotent + cheap; safe to call from FormClosing, NoUi-finally, and the
+# UI-mode try-catch wrapper around bootstrap-qemu.ps1.
+function Stop-AllChildren {
+    param($Procs)
+    foreach ($p in $Procs) {
+        if ($null -ne $p -and -not $p.HasExited) {
+            try { $p.Kill() } catch {}
+            try { $p.WaitForExit(3000) | Out-Null } catch {}
+        }
+    }
+}
 
 # Headless mode: drop into bootstrap-qemu.ps1's foreground launch path, do
 # the worker cleanup in finally. This is the pre-UI behavior; kept for CI /
@@ -166,17 +207,28 @@ if ($Force)            { $qemuArgs.Force            = $true }
 if ($NoUi) {
     try { & $QemuBootstrap @qemuArgs }
     finally {
-        if ($workerProc -and -not $workerProc.HasExited) {
-            Write-Host ""
-            Write-Host "Stopping worker (pid=$($workerProc.Id))..."
-            try { $workerProc.Kill() } catch {}
-        }
+        Write-Host ""
+        Write-Host "Stopping worker..."
+        Stop-AllChildren @($workerProc)
+        try { Stop-Transcript | Out-Null } catch {}
     }
     return
 }
 
 # UI mode: launch QEMU detached, then open a small control window.
-$qemuProc = & $QemuBootstrap @qemuArgs -Detached
+# Wrap in try/catch so a bootstrap failure (qemu-img, seed ISO, worker probe,
+# whatever) doesn't leave the worker running -- which would block the next
+# launch via :$WorkerPort and pin worker.log open in this shell.
+try {
+    $qemuProc = & $QemuBootstrap @qemuArgs -Detached
+} catch {
+    Write-Host ""
+    Write-Host "QEMU bootstrap failed: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Logs in: $LogDir" -ForegroundColor Yellow
+    Stop-AllChildren @($workerProc)
+    try { Stop-Transcript | Out-Null } catch {}
+    throw
+}
 
 # --- 4. Control UI (WinForms) ---
 Add-Type -AssemblyName System.Windows.Forms
@@ -188,20 +240,21 @@ $controlUrl = "http://127.0.0.1:$ControlPort"
 
 $form        = New-Object System.Windows.Forms.Form
 $form.Text   = 'Sirepo_Win'
-$form.Size   = New-Object System.Drawing.Size(540, 480)
+$form.Size   = New-Object System.Drawing.Size(560, 520)
 $form.StartPosition = 'CenterScreen'
-$form.MinimumSize   = New-Object System.Drawing.Size(420, 360)
+$form.MinimumSize   = New-Object System.Drawing.Size(420, 380)
 
-# Layout: 1-column TableLayoutPanel. Rows: status / button / button / log / quit.
+# Layout: status / open / update / open-logs / log-textbox / quit
 $tlp = New-Object System.Windows.Forms.TableLayoutPanel
 $tlp.Dock        = 'Fill'
 $tlp.ColumnCount = 1
-$tlp.RowCount    = 5
+$tlp.RowCount    = 6
 [void]$tlp.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 100)))
 [void]$tlp.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 60)))   # status
-[void]$tlp.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 36)))   # open
+[void]$tlp.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 36)))   # open Sirepo
 [void]$tlp.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 36)))   # update
-[void]$tlp.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100)))       # log
+[void]$tlp.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 30)))   # open logs
+[void]$tlp.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100)))   # log textbox
 [void]$tlp.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 44)))   # quit
 $tlp.Padding = New-Object System.Windows.Forms.Padding(10)
 $form.Controls.Add($tlp)
@@ -216,7 +269,9 @@ $btnOpen      = New-Object System.Windows.Forms.Button
 $btnOpen.Text = "Open Sirepo in browser  ($sirepoUrl)"
 $btnOpen.Dock = 'Fill'
 $btnOpen.Enabled = $false   # enabled once Sirepo answers
-$btnOpen.Add_Click({ Start-Process $sirepoUrl }.GetNewClosure())
+$btnOpen.Add_Click({
+    try { Start-Process $sirepoUrl } catch { [System.Windows.Forms.MessageBox]::Show("Could not open browser: $_") | Out-Null }
+}.GetNewClosure())
 $tlp.Controls.Add($btnOpen, 0, 1)
 
 $btnUpdate         = New-Object System.Windows.Forms.Button
@@ -225,6 +280,15 @@ $btnUpdate.Dock    = 'Fill'
 $btnUpdate.Enabled = $false   # enabled once /status is reachable
 $tlp.Controls.Add($btnUpdate, 0, 2)
 
+$btnLogs      = New-Object System.Windows.Forms.Button
+$btnLogs.Text = "Open logs folder  ($LogDir)"
+$btnLogs.Dock = 'Fill'
+$btnLogs.TextAlign = 'MiddleLeft'
+$btnLogs.Add_Click({
+    try { Start-Process explorer.exe $LogDir } catch {}
+}.GetNewClosure())
+$tlp.Controls.Add($btnLogs, 0, 3)
+
 $log              = New-Object System.Windows.Forms.TextBox
 $log.Multiline    = $true
 $log.ReadOnly     = $true
@@ -232,14 +296,14 @@ $log.ScrollBars   = 'Vertical'
 $log.Dock         = 'Fill'
 $log.Font         = New-Object System.Drawing.Font('Consolas', 9)
 $log.BackColor    = [System.Drawing.Color]::WhiteSmoke
-$tlp.Controls.Add($log, 0, 3)
+$tlp.Controls.Add($log, 0, 4)
 
 $btnQuit         = New-Object System.Windows.Forms.Button
 $btnQuit.Text    = 'Quit (stop Sirepo + worker)'
 $btnQuit.Dock    = 'Fill'
 $btnQuit.BackColor = [System.Drawing.Color]::LightCoral
 $btnQuit.Add_Click({ $form.Close() }.GetNewClosure())
-$tlp.Controls.Add($btnQuit, 0, 4)
+$tlp.Controls.Add($btnQuit, 0, 5)
 
 # Tiny helper to append a timestamped line to the log textbox.
 $appendLog = {
@@ -251,6 +315,7 @@ $appendLog = {
 & $appendLog "Worker pid=$($workerProc.Id) listening on :$WorkerPort"
 & $appendLog "QEMU   pid=$($qemuProc.Id), Sirepo will be at $sirepoUrl"
 & $appendLog "Control endpoint :$ControlPort (in-guest)"
+& $appendLog "Logs:  $LogDir"
 
 # Status poller. Hits Sirepo's / and the control endpoint's /status every
 # few seconds; flips button-enabled states based on what's reachable.
@@ -378,28 +443,20 @@ $btnUpdate.Add_Click({
 }.GetNewClosure())
 
 # FormClosing fires for both X-button and our Quit button. Kill QEMU + worker
-# here so the user can't end up with orphans.
+# here so the user can't end up with orphans. Stop-AllChildren includes a
+# WaitForExit timeout so a wedged Kill() can't freeze the UI.
 $form.Add_FormClosing({
     param($s, $e)
     $timer.Stop()
-    if ($qemuProc -and -not $qemuProc.HasExited) {
-        try { $qemuProc.Kill() } catch {}
-    }
-    if ($workerProc -and -not $workerProc.HasExited) {
-        try { $workerProc.Kill() } catch {}
-    }
+    Stop-AllChildren @($qemuProc, $workerProc)
 }.GetNewClosure())
 
 Write-Host ""
 Write-Host "Control window open. Close it or click Quit to stop Sirepo."
-[void]$form.ShowDialog()
-
-# After the form closes, the FormClosing handler has already killed both
-# procs. Wait briefly for the OS to reap them so the script's exit looks
-# clean.
-foreach ($p in @($qemuProc, $workerProc)) {
-    if ($p -and -not $p.HasExited) {
-        try { $p.WaitForExit(2000) | Out-Null } catch {}
-    }
+try {
+    [void]$form.ShowDialog()
+} finally {
+    Stop-AllChildren @($qemuProc, $workerProc)
+    Write-Host "Sirepo_Win stopped. Logs: $LogDir"
+    try { Stop-Transcript | Out-Null } catch {}
 }
-Write-Host "Sirepo_Win stopped."
