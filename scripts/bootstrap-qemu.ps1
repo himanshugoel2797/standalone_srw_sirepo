@@ -34,11 +34,16 @@
   Cloud-init installs and starts Sirepo on first boot. Total bundle on disk
   (qemu/ + Ubuntu jammy image + overlay + python-native): ~1 GB.
 
-.PARAMETER UbuntuUrl
-  HTTPS URL of Ubuntu cloud qcow2.
+.PARAMETER BaseImageUrl
+  HTTPS URL of the base cloud qcow2. Default is Debian 12 (bookworm)
+  genericcloud, ~330 MB compressed. Any cloud-init NoCloud-friendly
+  qcow2 should work.
 
-.PARAMETER Sha256SumsUrl
-  URL of SHA256SUMS file alongside the qcow2.
+.PARAMETER ChecksumsUrl
+  URL of the SHA512SUMS (or SHA256SUMS) file alongside the qcow2.
+
+.PARAMETER ChecksumAlgorithm
+  'SHA512' or 'SHA256'. Defaults to SHA512 (Debian).
 
 .PARAMETER Memory
   Guest memory in GB. Default 4.
@@ -50,21 +55,22 @@
   Windows host port that maps to the VM's port 8000. Default 8000.
 
 .PARAMETER Force
-  Wipe overlay disk + re-generate seed ISO. Keeps MSYS2 and Ubuntu image.
+  Wipe overlay disk + re-generate seed ISO. Keeps QEMU and the base image.
 
 .PARAMETER NoStart
   Set up everything but don't launch QEMU at the end.
 #>
 [CmdletBinding()]
 param(
-    # Ubuntu 22.04 (jammy, kernel 5.15) is the well-trodden TCG combo. Noble
-    # (24.04, kernel 6.8) panics on IO-APIC timer init under TCG -- working
-    # around that needs -kernel/-initrd/-append "noapic" + tracking the
-    # cloud-images unpacked artifacts separately. Not worth the fragility for
-    # a backend whose job is to be a portable demo target. Override these
-    # params if you have a TCG fix and want noble back.
-    [string]$UbuntuUrl     = 'https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img',
-    [string]$Sha256SumsUrl = 'https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS',
+    # Debian 12 (bookworm, kernel 6.1) genericcloud is ~330 MB vs Ubuntu
+    # jammy's ~660 MB and still has cloud-init pre-installed + python 3.11
+    # in main. The "genericcloud" variant uses the NoCloud datasource by
+    # default, which is exactly what our seed ISO ships. Debian publishes
+    # SHA512SUMS (not SHA256SUMS); the verifier handles either.
+    [string]$BaseImageUrl       = 'https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2',
+    [string]$ChecksumsUrl       = 'https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS',
+    [ValidateSet('SHA512','SHA256')]
+    [string]$ChecksumAlgorithm  = 'SHA512',
     # Prebuilt portable QEMU bundle. Defaults read SIREPO_WIN_QEMU_URL /
     # SIREPO_WIN_QEMU_SHA256 (set by setup.ps1 or for local-bundle testing).
     # The "real" prod URL lives in setup.ps1 as a constant; this script
@@ -102,7 +108,10 @@ $QemuExe        = Join-Path $QemuDir 'bin\qemu-system-x86_64.exe'
 $QemuImgExe     = Join-Path $QemuDir 'bin\qemu-img.exe'
 $QemuShareDir   = Join-Path $QemuDir 'share\qemu'
 
-$BaseImage      = Join-Path $CacheDir 'ubuntu-22.04-jammy-amd64.qcow2'
+# Cache filename derived from the URL so switching distros doesn't collide
+# in $CacheDir (e.g. debian-12-genericcloud-amd64.qcow2 vs the old Ubuntu image).
+$BaseImageFilename = Split-Path -Leaf ([Uri]::new($BaseImageUrl).AbsolutePath)
+$BaseImage      = Join-Path $CacheDir $BaseImageFilename
 $OverlayImage   = Join-Path $VmDir 'overlay.qcow2'
 $SeedIso        = Join-Path $VmDir 'seed.iso'
 
@@ -195,42 +204,45 @@ qemu: $verLine
 
 Write-Host "Using: $QemuExe"
 
-# --- 3. Download Ubuntu cloud qcow2 + verify SHA256 ---
+# --- 3. Download base cloud qcow2 + verify checksum ---
 Write-Host ""
-Write-Host "--- Ubuntu cloud image ($UbuntuUrl) ---"
+Write-Host "--- Base cloud image ($BaseImageUrl) ---"
 
-function Get-Sha256FromSums {
+function Get-HashFromSums {
+    # Both Debian's SHA512SUMS and Ubuntu's SHA256SUMS use the BSD/coreutils
+    # "<hex>  <filename>" format. Trust whatever hex length is on the line --
+    # the caller has already committed to an algorithm via Get-FileHash.
     param([string]$Url, [string]$Filename)
     $resp = Invoke-WebRequest -Uri $Url -UseBasicParsing
     $text = if ($resp.Content -is [byte[]]) {
         [System.Text.Encoding]::UTF8.GetString($resp.Content)
     } else { [string]$resp.Content }
     foreach ($line in ($text -split "`r?`n")) {
-        if ($line -match '^([0-9a-f]{64})\s+\*?(.+)$' -and $Matches[2].Trim() -eq $Filename) {
+        if ($line -match '^([0-9a-f]+)\s+\*?(.+)$' -and $Matches[2].Trim() -eq $Filename) {
             return $Matches[1].ToLower()
         }
     }
-    throw "No SHA256 entry for '$Filename' in $Url"
+    throw "No checksum entry for '$Filename' in $Url"
 }
 
-$qcowFilename = Split-Path -Leaf $UbuntuUrl
+$qcowFilename = Split-Path -Leaf $BaseImageUrl
 $baseQcowCache = Join-Path $CacheDir $qcowFilename
 if (-not (Test-Path $baseQcowCache) -or $Force) {
-    Write-Host "Downloading $UbuntuUrl"
+    Write-Host "Downloading $BaseImageUrl"
     $oldPP = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'
-    try { Invoke-WebRequest -Uri $UbuntuUrl -OutFile $baseQcowCache -UseBasicParsing }
+    try { Invoke-WebRequest -Uri $BaseImageUrl -OutFile $baseQcowCache -UseBasicParsing }
     finally { $ProgressPreference = $oldPP }
 } else {
     Write-Host "Cached: $baseQcowCache"
 }
-$expectedSha = Get-Sha256FromSums -Url $Sha256SumsUrl -Filename $qcowFilename
-$actual = (Get-FileHash $baseQcowCache -Algorithm SHA256).Hash.ToLower()
+$expectedSha = Get-HashFromSums -Url $ChecksumsUrl -Filename $qcowFilename
+$actual = (Get-FileHash $baseQcowCache -Algorithm $ChecksumAlgorithm).Hash.ToLower()
 if ($actual -ne $expectedSha) {
     Remove-Item $baseQcowCache -Force
-    throw "Ubuntu qcow2 SHA256 mismatch (expected $expectedSha, got $actual). Cached file removed; re-run."
+    throw "Base image $ChecksumAlgorithm mismatch (expected $expectedSha, got $actual). Cached file removed; re-run."
 }
-Write-Host "Ubuntu image verified: $actual"
+Write-Host "Base image verified ($ChecksumAlgorithm): $actual"
 
 if (-not (Test-Path $BaseImage) -or $Force) {
     Copy-Item -Path $baseQcowCache -Destination $BaseImage -Force
@@ -333,8 +345,9 @@ $indentedControlSrvContent
       Environment=SIREPO_FEATURE_CONFIG_TRUST_SH_ENV=1
       Environment=SIREPO_FEATURE_CONFIG_SIM_TYPES=srw
       # Disable the Vue dev server: it only matters for cortex (not SRW), and
-      # vite requires Node 18+ -- Ubuntu 22.04 ships Node 12 and ships nothing
-      # newer in the default repos. Empty value -> _start_vue_server is a no-op.
+      # vite requires Node 18+. Keeping this disabled lets us run on any
+      # distro without nodejs in the default repos. Empty value ->
+      # _start_vue_server is a no-op.
       Environment=SIREPO_FEATURE_CONFIG_VUE_SIM_TYPES=
       Environment=SIREPO_JOB_DRIVER_MODULES=local:windows_native
       Environment=SIREPO_JOB_DRIVER_WINDOWS_NATIVE_WORKER_URL=http://10.0.2.2:$WorkerPort
