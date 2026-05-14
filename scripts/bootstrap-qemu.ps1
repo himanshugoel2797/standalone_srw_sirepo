@@ -75,10 +75,15 @@ param(
     [int]   $Cpus          = 2,
     [int]   $HostPort      = 8000,
     [int]   $WorkerPort    = 8311,
+    [int]   $ControlPort   = 8312,
     [string]$SirepoRef     = 'master',
     [string]$PykernRef     = 'master',
     [switch]$Force,
-    [switch]$NoStart
+    [switch]$NoStart,
+    # Launch QEMU as a detached background process (Start-Process -PassThru)
+    # so the caller can keep running (e.g. setup.ps1's WinForms control UI).
+    # In this mode the script returns the QEMU process; the caller owns cleanup.
+    [switch]$Detached
 )
 
 $ErrorActionPreference = 'Stop'
@@ -264,6 +269,11 @@ if (-not (Test-Path $patchHost)) { throw "Missing patch $patchHost" }
 $patchContent = (Get-Content -Raw $patchHost) -replace "`r",''
 $indentedPatchContent = ($patchContent -split "`n" | ForEach-Object { '      ' + $_ }) -join "`n"
 
+$controlSrvHost = Join-Path $PSScriptRoot 'control_server.py'
+if (-not (Test-Path $controlSrvHost)) { throw "Missing $controlSrvHost" }
+$controlSrvContent = (Get-Content -Raw $controlSrvHost) -replace "`r",''
+$indentedControlSrvContent = ($controlSrvContent -split "`n" | ForEach-Object { '      ' + $_ }) -join "`n"
+
 $userData = @"
 #cloud-config
 hostname: sirepo-qemu
@@ -286,6 +296,29 @@ $indentedShContent
     permissions: '0644'
     content: |
 $indentedPatchContent
+  - path: /usr/local/lib/sirepo-control/server.py
+    permissions: '0755'
+    content: |
+$indentedControlSrvContent
+  - path: /etc/systemd/system/sirepo-control.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Sirepo_Win control endpoint
+      # Doesn't strictly need sirepo.service running -- /status works either
+      # way -- but if it's after sirepo.service we don't race the restart logic
+      # in /update.
+      After=network-online.target
+
+      [Service]
+      Type=simple
+      Environment=SIREPO_CONTROL_PORT=$ControlPort
+      ExecStart=/usr/bin/python3 /usr/local/lib/sirepo-control/server.py
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
   - path: /etc/systemd/system/sirepo.service
     permissions: '0644'
     content: |
@@ -358,6 +391,7 @@ runcmd:
   - git clone --depth 50 https://github.com/radiasoft/sirepo.git /opt/sirepo
   - bash /usr/local/bin/install-sirepo.sh --patches /tmp/patches /opt/sirepo /opt/pykern
   - systemctl daemon-reload
+  - systemctl enable --now sirepo-control.service
   - systemctl enable --now sirepo.service
 "@
 
@@ -534,10 +568,27 @@ $qemuArgs = @(
     '-smp', "$Cpus",
     '-drive', "file=$OverlayImage,format=qcow2,if=virtio",
     '-drive', "file=$SeedIso,format=raw,media=cdrom",
-    '-netdev', "user,id=net0,hostfwd=tcp::${HostPort}-:8000",
+    # Two hostfwd entries: 8000 -> sirepo HTTP, $ControlPort -> in-guest
+    # control endpoint (the setup.ps1 WinForms UI talks to /update, /status,
+    # /sbatch_creds).
+    '-netdev', "user,id=net0,hostfwd=tcp::${HostPort}-:8000,hostfwd=tcp::${ControlPort}-:${ControlPort}",
     '-device', 'virtio-net,netdev=net0',
     '-L', $QemuShareDir,
     '-nographic'
 )
+
+if ($Detached) {
+    # Background launch: redirect QEMU stdout/stderr to a log file so the
+    # console output of the boot sequence is preserved without taking over
+    # the terminal. Caller (setup.ps1) keeps the process handle and is
+    # responsible for shutting it down.
+    $qemuLog = Join-Path $CacheDir 'qemu.log'
+    Write-Host "QEMU log: $qemuLog"
+    $qemuProc = Start-Process -FilePath $QemuExe -ArgumentList $qemuArgs `
+        -RedirectStandardOutput $qemuLog -RedirectStandardError "$qemuLog.err" `
+        -WindowStyle Hidden -PassThru
+    Write-Host "QEMU pid=$($qemuProc.Id) (detached)."
+    return $qemuProc
+}
 
 & $QemuExe @qemuArgs

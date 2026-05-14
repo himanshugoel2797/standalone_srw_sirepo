@@ -23,10 +23,15 @@ Ubuntu 22.04 cloud image ~600 MB, Python embeddable + srwpy ~80 MB, then
 boots a VM and installs Sirepo on first boot). Subsequent runs reuse the
 cached pieces and are back in QEMU in seconds.
 
-Once cloud-init finishes, open <http://localhost:8000> in your browser.
+A small control window pops up alongside the boot. Once Sirepo is reachable
+its "Open Sirepo in browser" button enables (or just point your browser at
+<http://localhost:8000>). The control window also exposes "Update Sirepo"
+(runs `git pull` + `pip install -e` + restarts the service inside the guest)
+and "Quit" (stops QEMU + worker). Closing the X also stops everything.
 
-Press Ctrl-C in the terminal to stop. The worker is killed on exit; the
-qcow2 overlay keeps state across restarts.
+For a headless/no-UI run (CI, server), pass `-NoUi` and use Ctrl-C to stop.
+
+The qcow2 overlay keeps state across restarts.
 
 ## Faster boot (optional, one-time)
 
@@ -104,15 +109,16 @@ Total disk: ~2 GB after first install.
 
 ## Component scripts (no need to run manually)
 
-| Script                                        | What it does                                                |
-|-----------------------------------------------|-------------------------------------------------------------|
-| `setup.ps1`                                   | Orchestrates everything (this is the only one to run)       |
-| `scripts/bootstrap-python-native.ps1`         | Python 3.12 embeddable + srwpy + worker deps                |
-| `scripts/bootstrap-qemu.ps1`                  | Download QEMU bundle, fetch jammy, build seed ISO, launch   |
-| `scripts/install-sirepo.sh`                   | Runs inside the VM via cloud-init                           |
-| `scripts/run-worker.ps1`                      | Manual worker launcher (for debugging)                      |
-| `worker/worker.py`                            | FastAPI: `/health`, `/run`, `/dav`                          |
-| `sirepo_patches/job_driver_windows_native.py` | The Sirepo-side driver stub                                 |
+| Script                                        | What it does                                                  |
+|-----------------------------------------------|---------------------------------------------------------------|
+| `setup.ps1`                                   | Orchestrates everything + opens the WinForms control window   |
+| `scripts/bootstrap-python-native.ps1`         | Python 3.12 embeddable + srwpy + worker deps                  |
+| `scripts/bootstrap-qemu.ps1`                  | Download QEMU bundle, fetch jammy, build seed ISO, launch     |
+| `scripts/install-sirepo.sh`                   | Runs inside the VM via cloud-init                             |
+| `scripts/control_server.py`                   | In-guest stdlib HTTP server: `/status`, `/update`, `/restart` |
+| `scripts/run-worker.ps1`                      | Manual worker launcher (for debugging)                        |
+| `worker/worker.py`                            | FastAPI: `/health`, `/run`, `/dav`                            |
+| `sirepo_patches/job_driver_windows_native.py` | The Sirepo-side driver stub                                   |
 
 ## Troubleshooting
 
