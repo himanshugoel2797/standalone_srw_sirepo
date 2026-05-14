@@ -585,15 +585,15 @@ $qemuArgs = @(
     # block cache (saves re-translation overhead on long-running guests).
     '-accel', 'whpx',
     '-accel', 'tcg,thread=multi,tb-size=512',
-    # -cpu max: expose every CPU feature the accelerator can pass through
-    # (AES-NI, AVX/AVX2, SHA-NI, etc.). The default `qemu64` model only
-    # advertises SSE2, which causes libraries with hand-rolled crypto SIMD
-    # (libcurl/libgnutls used by git-remote-https) to hit SIGILL on hosts
-    # where the runtime CPUID detection sees AES-NI on the underlying CPU
-    # but the trapped guest CPU can't execute it. Symptom: cloud-init's
-    # `git clone` dies with "git-remote-https died of signal 4" and the
-    # install silently fails.
-    '-cpu', 'max',
+    # Skylake-Client-noTSX-IBRS is a well-tested WHPX-compatible CPU model.
+    # We need AES-NI + AVX2 + SHA-NI for git's HTTPS crypto path (default
+    # qemu64 only advertises SSE2, which causes libcurl/libgnutls to hit
+    # SIGILL when CPUID detection picks the hand-rolled SIMD codepath).
+    # `-cpu max` is the natural choice but advertises MPX and APX, which
+    # WHPX can't emulate -- the guest crashes with "VP exit code 4" (memory
+    # access fault) before cloud-init even runs. Skylake-Client is the
+    # newest well-known model without MPX/APX.
+    '-cpu', 'Skylake-Client-noTSX-IBRS',
     '-m', "${Memory}G",
     '-smp', "$Cpus",
     '-drive', "file=$OverlayImage,format=qcow2,if=virtio",

@@ -60,7 +60,7 @@ param(
     [string]$QemuBundleUrl    = $(if ($env:SIREPO_WIN_QEMU_URL) { $env:SIREPO_WIN_QEMU_URL }
                                   else { 'https://github.com/himanshugoel2797/standalone_srw_sirepo/releases/download/qemu-portable-v11.0.0-r1/qemu-portable.zip' }),
     [string]$QemuBundleSha256 = $(if ($env:SIREPO_WIN_QEMU_SHA256) { $env:SIREPO_WIN_QEMU_SHA256 }
-                                  else { '5d463141af73fad407703aedbb64d45a4fa376bc7786e42a67e09fe859fd48c2' }),
+                                  else { 'a6ec792a1670c094632e2b48bec1bfb4104e8e1e465f6b205eb105b6f4b5aee0' }),
     [switch]$NoUi,
     [switch]$Force
 )
