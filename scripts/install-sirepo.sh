@@ -1,12 +1,12 @@
 #!/bin/bash
-# Install Sirepo + pykern into /opt/sirepo-venv inside a Linux env.
-# Backend-agnostic: invoked the same way by the WSL2 and QEMU bootstrap paths.
+# Install Sirepo + pykern into /opt/sirepo-venv inside the QEMU guest.
+# Inlined into cloud-init's write_files by scripts/bootstrap-qemu.ps1 and
+# run on first boot.
 #
 # Usage: install-sirepo.sh [--force] [--patches <dir>] <sirepo-src-dir> <pykern-src-dir>
 #
 # Source dirs must contain a checked-out clone of radiasoft/sirepo and
-# radiasoft/pykern respectively. They can be anywhere readable -- /mnt/c/... for
-# the WSL2 path, /opt/... for the QEMU path.
+# radiasoft/pykern respectively (cloud-init does this into /opt/{sirepo,pykern}).
 #
 # --patches <dir> optionally copies Sirepo_Win-side overlay files into the
 # sirepo source tree after the editable install. Currently used for the

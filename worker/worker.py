@@ -1,10 +1,10 @@
 r"""
 Sirepo_Win native-Windows SRW worker.
 
-Receives compute jobs from the Sirepo job supervisor inside the Linux backend
-(WSL2 or QEMU/TCG) over HTTP and runs them under native CPython with native
-srwpy. The point is to dodge the 10-50x TCG slowdown for QEMU users and to
-keep the WSL2 /mnt/c filesystem out of the hot loop.
+Receives compute jobs from the Sirepo job supervisor (running inside the QEMU
+guest) over HTTP and runs them under native CPython with native srwpy. The
+point is to dodge the TCG slowdown when the user has no hardware-virt
+enabled, and to keep heavy SRW compute on the Windows side regardless.
 
 Also serves <project>/state/runs/ to the QEMU VM via WebDAV under /dav/.
 This is the narrow data pipe between Sirepo (running inside the VM with its
@@ -12,7 +12,7 @@ source at /opt/sirepo) and this worker (running natively on Windows): Sirepo
 writes a job's run.py + inputs into /mnt/host-runs/<jid>/ inside the guest;
 the worker reads them back from <project>/state/runs/<jid>/ on the host and
 executes natively. The VM mounts http://10.0.2.2:<port>/dav/ via davfs2 at
-boot. WSL2 has /mnt/c directly so doesn't need the /dav route.
+boot.
 
 Endpoints
 ---------
@@ -43,10 +43,9 @@ POST /run
     WebDAV view of WEBDAV_ROOT (defaults to <project>/state/runs).
     Anonymous auth (loopback-only exposure).
 
-The driver in the Linux env hands us a Linux path; we translate it to a
-Windows path via the WORKER_PATH_MAP env var (linux_prefix=windows_prefix
-pairs, comma-separated). Default map: /mnt/host-runs -> <state/runs>, plus
-/mnt/<drive> -> <DRIVE>:\\ for the WSL2 case.
+The driver in the guest hands us a Linux path; we translate it to a Windows
+path via the WORKER_PATH_MAP env var (linux_prefix=windows_prefix pairs,
+comma-separated). Default map: /mnt/host-runs -> <state/runs>.
 """
 from __future__ import annotations
 
@@ -90,14 +89,10 @@ os.makedirs(WEBDAV_ROOT, exist_ok=True)
 WEBDAV_MOUNT = "/dav"
 
 
-# Path translation. Default maps:
-#   /mnt/host-runs/...     -> WEBDAV_ROOT/...    (QEMU backend's narrow share)
-#   /mnt/<drive>/<rest>    -> <DRIVE>:\<rest>    (WSL2 backend's /mnt/c style)
+# Path translation. Default: /mnt/host-runs/<jid> -> WEBDAV_ROOT/<jid>.
 # Override with WORKER_PATH_MAP="<linux>=<windows>,<linux>=<windows>".
 def _default_path_map() -> list[tuple[str, str]]:
-    return [
-        ("/mnt/host-runs", WEBDAV_ROOT),
-    ] + [(f"/mnt/{c}", f"{c.upper()}:\\") for c in "abcdefghijklmnopqrstuvwxyz"]
+    return [("/mnt/host-runs", WEBDAV_ROOT)]
 
 
 def _parse_path_map(raw: str | None) -> list[tuple[str, str]]:
@@ -255,7 +250,7 @@ def main() -> None:
     # Bind loopback by default. QEMU slirp NATs the guest's 10.0.2.2 traffic to
     # the host's 127.0.0.1 (slirp `host_addr` default is loopback), so the VM
     # can reach us without needing 0.0.0.0 and the firewall-rule song-and-dance
-    # that goes with it. Override to 0.0.0.0 if you also need WSL2 / LAN access.
+    # that goes with it.
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8311)
     args = p.parse_args()

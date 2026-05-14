@@ -1,8 +1,9 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-  Bootstrap an embedded QEMU/TCG Linux VM hosting Sirepo. Truly portable
-  backend alternative to bootstrap-wsl.ps1 -- requires NO admin elevation.
+  Bootstrap an embedded QEMU Linux VM hosting Sirepo. Fully portable --
+  requires NO admin elevation. Uses WHPX (Windows Hypervisor Platform) for
+  near-native speed when available, falls back to TCG software emulation.
 
 .DESCRIPTION
   Pipeline (all under <project>\, no admin, no Windows features):
@@ -115,7 +116,7 @@ $RunsHost       = Join-Path $ProjectRoot 'state\runs'
 # $RunsHost on the Windows side and executes natively.
 $WebdavGuestUrl = "http://10.0.2.2:$WorkerPort/dav/"
 
-Write-Host "=== Sirepo_Win embedded-VM (QEMU/TCG) bootstrap ==="
+Write-Host "=== Sirepo_Win embedded-VM (QEMU) bootstrap ==="
 Write-Host "project root: $ProjectRoot"
 Write-Host "msys64 dir:   $Msys64Dir  (portable QEMU lives here)"
 Write-Host "vm dir:       $VmDir"

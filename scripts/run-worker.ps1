@@ -4,21 +4,20 @@
   Start the native-Windows SRW worker.
 
 .DESCRIPTION
-  The worker runs on the Windows host, outside whichever Linux backend hosts
+  The worker runs on the Windows host, outside the QEMU guest that hosts
   Sirepo. Sirepo's windows_native job driver POSTs compute jobs here so srwpy
-  runs at native speed (not the 10-50x TCG slowdown under QEMU, and not over
-  the slow /mnt/c bridge under WSL2).
+  runs at native speed instead of inside the VM (where TCG-emulated FP work
+  is 10-50x slower than native).
 
-  Binds 127.0.0.1 by default. The Linux guest reaches the worker via the host
-  side of its NIC (WSL2: $(ip route show default | awk '/default/{print \$3}')
-  -- QEMU/slirp: 10.0.2.2). The driver discovers the URL at runtime.
+  Binds 127.0.0.1 by default. QEMU slirp NATs guest traffic to 10.0.2.2 ->
+  host loopback so the guest reaches us without any firewall rule.
 
 .PARAMETER Port
   TCP port to listen on. Default 8311.
 
-.PARAMETER Host
+.PARAMETER BindHost
   Bind address. Default 127.0.0.1. Pass 0.0.0.0 only when you understand the
-  exposure (e.g. a QEMU hostfwd is forwarding the guest port back at us).
+  exposure.
 #>
 [CmdletBinding()]
 param(

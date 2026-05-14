@@ -1,17 +1,18 @@
 # Portable installs — bulky, reproducible from scripts, never committed.
 /msys64/
 /python-native/
-/msmpi/
-/sirepo/
-/pykern/
-/wsl/
 /qemu-vm/
 
-# Download cache + extractor tools fetched at bootstrap time.
+# Download cache fetched at bootstrap time.
 /.cache/
 
 # Mutable runtime state (sirepo db, logs, sessions, sims).
 /state/
+
+# Leftover from the now-removed WSL2 backend; ignore in case they linger.
+/sirepo/
+/pykern/
+/wsl/
 
 # Editor / OS noise.
 *.swp
