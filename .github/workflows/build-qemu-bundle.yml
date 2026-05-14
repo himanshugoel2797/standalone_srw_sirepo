@@ -1,0 +1,119 @@
+name: Build QEMU portable bundle
+
+# Builds an x86_64-only portable QEMU bundle by pacman-installing
+# mingw-w64-x86_64-qemu under MSYS2 inside a Windows runner, then staging just
+# the bits we use (qemu-system-x86_64.exe, qemu-img.exe, runtime DLLs, x86
+# firmware blobs). The result is published as a GitHub Release asset that
+# scripts/bootstrap-qemu.ps1 downloads -- no MSYS2 install on the user's box.
+#
+# Trigger manually: Actions tab > "Build QEMU portable bundle" > Run workflow.
+# Pick a release tag (e.g. qemu-portable-v11.0.0-r1) and the workflow creates
+# a release with qemu-portable.zip + qemu-portable.zip.sha256 attached.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag (e.g. qemu-portable-v11.0.0-r1)'
+        required: true
+        default: 'qemu-portable-v11.0.0-r1'
+      release_name:
+        description: 'Human-readable release name'
+        required: true
+        default: 'QEMU portable bundle v11.0.0'
+
+permissions:
+  contents: write  # needed for softprops/action-gh-release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Setup MSYS2 + install QEMU
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-qemu
+          update: false
+
+      - name: Stage portable bundle (x86_64 only)
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          mkdir -p qemu-portable/bin qemu-portable/share/qemu
+
+          # Two executables we actually invoke. Drop the other ~60 arch
+          # binaries (~30-50 MB each).
+          cp /mingw64/bin/qemu-system-x86_64.exe qemu-portable/bin/
+          cp /mingw64/bin/qemu-img.exe           qemu-portable/bin/
+
+          # Take all DLLs in /mingw64/bin. They're a near-perfect closure of
+          # QEMU's link deps (pacman only fetched mingw-w64-x86_64-qemu and
+          # its transitive deps). Pruning by ldd is doable but mostly saves
+          # tens of MB out of ~150 MB total -- not worth the fragility.
+          cp /mingw64/bin/*.dll qemu-portable/bin/
+
+          # share/qemu is firmware for every QEMU-supported arch. The big
+          # ones we don't need (~250 MB out of 316 MB):
+          #   edk2-aarch64-code.fd / edk2-arm-* : 64 MB each, UEFI for ARM
+          #   edk2-loongarch64-* / edk2-riscv-* : 16-32 MB each
+          #   opensbi-* / palcode-* / openbios-* / hppa-firmware* / slof.bin
+          #   u-boot* / s390-* / qemu_vga.ndrv / skiboot.lid / npcm* / ast*
+          # x86 firmware (bios*.bin, vgabios*.bin, efi-*.rom, pxe-*.rom,
+          # edk2-x86_64-*, kvmvapic.bin, linuxboot*, multiboot*, sgabios.bin)
+          # is small (~10 MB total) -- keep everything else.
+          shopt -s extglob
+          cd /mingw64/share/qemu
+          for f in *; do
+            case "$f" in
+              edk2-aarch64-*|edk2-arm-*|edk2-loongarch64-*|edk2-riscv-*) ;;
+              opensbi-*|palcode-*|openbios-*|hppa-firmware*|slof.bin) ;;
+              u-boot*|s390-*|qemu_vga.ndrv|skiboot.lid|bamboo.dtb) ;;
+              canyonlands.dtb|petalogix-*|npcm*|ast*) ;;
+              firmware) ;;     # JSON descriptors for arch firmware we dropped
+              *)
+                cp -r "$f" "$GITHUB_WORKSPACE/qemu-portable/share/qemu/"
+                ;;
+            esac
+          done
+
+          cd "$GITHUB_WORKSPACE"
+          echo "--- bundle contents ---"
+          du -sh qemu-portable qemu-portable/bin qemu-portable/share/qemu
+          echo
+          echo "--- top 10 largest files ---"
+          find qemu-portable -type f -printf '%s %p\n' | sort -rn | head -10
+
+      - name: Record QEMU version
+        shell: msys2 {0}
+        run: |
+          pacman -Q mingw-w64-x86_64-qemu > qemu-portable/VERSION.txt
+          cat qemu-portable/VERSION.txt
+
+      - name: Zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path qemu-portable\* -DestinationPath qemu-portable.zip -CompressionLevel Optimal
+          $sha = (Get-FileHash qemu-portable.zip -Algorithm SHA256).Hash.ToLower()
+          $size = (Get-Item qemu-portable.zip).Length
+          Write-Host "qemu-portable.zip  size=$size bytes  sha256=$sha"
+          $sha | Out-File -NoNewline -Encoding ascii qemu-portable.zip.sha256
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:   ${{ inputs.release_tag }}
+          name:       ${{ inputs.release_name }}
+          body: |
+            Portable QEMU bundle built from MSYS2's `mingw-w64-x86_64-qemu`.
+            x86_64 only; UI deps absent (QEMU runs with `-display none`);
+            non-x86 EDK2 firmware excluded.
+
+            Extract under `<project>/qemu/`. Entry point:
+            `qemu/bin/qemu-system-x86_64.exe`.
+
+            `scripts/bootstrap-qemu.ps1` downloads this asset, verifies the
+            SHA256, and unzips it. No MSYS2 install on the user's machine.
+          files: |
+            qemu-portable.zip
+            qemu-portable.zip.sha256

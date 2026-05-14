@@ -8,20 +8,20 @@ the folder to uninstall.
 
 In PowerShell (or double-click `setup.bat`):
 
-```
+```powershell
 .\setup.bat
 ```
 
 or
 
-```
+```powershell
 .\setup.ps1
 ```
 
-First run takes ~10-15 min (downloads MSYS2 + portable QEMU + Ubuntu 22.04
-cloud image + Python embeddable + srwpy, then boots a VM and installs Sirepo
-on first boot). Subsequent runs reuse the cached pieces and are back in QEMU
-in seconds.
+First run takes ~5-10 min (downloads the portable QEMU bundle ~110 MB,
+Ubuntu 22.04 cloud image ~600 MB, Python embeddable + srwpy ~80 MB, then
+boots a VM and installs Sirepo on first boot). Subsequent runs reuse the
+cached pieces and are back in QEMU in seconds.
 
 Once cloud-init finishes, open <http://localhost:8000> in your browser.
 
@@ -43,21 +43,21 @@ WSL2/Docker Desktop/Hyper-V users already have WHPX enabled.
 
 ## What it builds
 
-```
+```text
 Sirepo_Win/
-├── msys64/         portable MSYS2 -> portable QEMU 11.0.0 (~700 MB)
+├── qemu/           portable QEMU bundle (~290 MB extracted; downloaded as ~110 MB zip from GH Releases)
 ├── python-native/  Python 3.12 embeddable + srwpy + worker deps (~100 MB)
 ├── qemu-vm/        cloud-init seed.iso + writable overlay.qcow2
-├── .cache/         downloads (Ubuntu image, MSYS2 base, etc.)
+├── .cache/         downloads (Ubuntu image, bundle zip, etc.)
 ├── state/runs/     SRW job inputs/outputs (shared with the guest via WebDAV)
-└── (msys64/python-native/qemu-vm/.cache/state are all gitignored)
+└── (qemu/python-native/qemu-vm/.cache/state are all gitignored)
 ```
 
-Total disk: ~3 GB after first install.
+Total disk: ~2 GB after first install.
 
 ## Architecture
 
-```
+```text
 [Windows host]                          [QEMU guest (Ubuntu 22.04 LTS)]
  ┌───────────────────────┐               ┌────────────────────────────────┐
  │ Browser :8000  ◄──────┼──slirp:hostfwd┼──► Sirepo HTTP :8000           │
@@ -94,18 +94,25 @@ Total disk: ~3 GB after first install.
   `/opt/pykern`). The patch file in `sirepo_patches/` is inlined into
   cloud-init's `write_files` and copied into the source tree post-install.
 
+- **Where does the QEMU bundle come from?**
+  [.github/workflows/build-qemu-bundle.yml](.github/workflows/build-qemu-bundle.yml)
+  runs on a Windows GitHub Actions runner: it pacman-installs MSYS2's
+  `mingw-w64-x86_64-qemu`, stages just the bits we use (`qemu-system-x86_64.exe`,
+  `qemu-img.exe`, runtime DLLs, x86 firmware), zips them, and attaches the
+  result to a GitHub Release. `bootstrap-qemu.ps1` downloads + SHA-verifies
+  the asset. Re-run the workflow whenever MSYS2 ships a newer QEMU.
+
 ## Component scripts (no need to run manually)
 
-| Script                                | What it does                                  |
-| ------------------------------------- | --------------------------------------------- |
-| `setup.ps1`                           | Orchestrates everything (this is the only one to run) |
-| `scripts/bootstrap-msys2.ps1`         | Portable MSYS2 install (no admin)             |
-| `scripts/bootstrap-python-native.ps1` | Python 3.12 embeddable + srwpy + worker deps  |
-| `scripts/bootstrap-qemu.ps1`          | pacman-install QEMU, download jammy, build seed ISO, launch |
-| `scripts/install-sirepo.sh`           | Runs inside the VM via cloud-init             |
-| `scripts/run-worker.ps1`              | Manual worker launcher (for debugging)        |
-| `worker/worker.py`                    | FastAPI: `/health`, `/run`, `/dav`            |
-| `sirepo_patches/job_driver_windows_native.py` | The Sirepo-side driver stub           |
+| Script                                        | What it does                                                |
+|-----------------------------------------------|-------------------------------------------------------------|
+| `setup.ps1`                                   | Orchestrates everything (this is the only one to run)       |
+| `scripts/bootstrap-python-native.ps1`         | Python 3.12 embeddable + srwpy + worker deps                |
+| `scripts/bootstrap-qemu.ps1`                  | Download QEMU bundle, fetch jammy, build seed ISO, launch   |
+| `scripts/install-sirepo.sh`                   | Runs inside the VM via cloud-init                           |
+| `scripts/run-worker.ps1`                      | Manual worker launcher (for debugging)                      |
+| `worker/worker.py`                            | FastAPI: `/health`, `/run`, `/dav`                          |
+| `sirepo_patches/job_driver_windows_native.py` | The Sirepo-side driver stub                                 |
 
 ## Troubleshooting
 
@@ -120,9 +127,14 @@ or pass `-WorkerPort <free port>` to `setup.ps1`.
 hasn't finished yet, or Sirepo crashed inside the VM. Check the QEMU console
 output; `sirepo.service` logs go to systemd journal inside the guest.
 
+**`No QEMU bundle URL configured`.** Either the GH Releases asset doesn't
+exist yet (run the `build-qemu-bundle` workflow), or the default URL in
+`setup.ps1` points to the wrong repo. Override with `-QemuBundleUrl` and
+`-QemuBundleSha256` or set `SIREPO_WIN_QEMU_URL` / `SIREPO_WIN_QEMU_SHA256`.
+
 **Need to start over.** `Remove-Item -Recurse -Force qemu-vm,.cache,state`
 (or just delete those folders) and re-run `.\setup.ps1`. To re-download
-MSYS2/QEMU/Python too, also delete `msys64` and `python-native`.
+QEMU/Python too, also delete `qemu` and `python-native`.
 
 ## License
 

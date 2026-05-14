@@ -7,37 +7,32 @@
 
 .DESCRIPTION
   Pipeline (all under <project>\, no admin, no Windows features):
-    1. Bootstrap MSYS2 into <project>\msys64 via scripts\bootstrap-msys2.ps1.
-       MSYS2 is needed only as a portable package fetcher: `pacman -S
-       mingw-w64-x86_64-qemu` gives us real QEMU binaries + all their
-       transitive DLL deps without touching system paths or registry.
-       (Stefan Weil's standalone QEMU installer is the canonical Windows
-       binary distribution, but its NSIS requires-admin manifest makes it
-       unusable for a no-admin install. MSYS2's package archive is the
-       portable alternative.)
-    2. pacman-install mingw-w64-x86_64-qemu. ~500 MB of QEMU+deps land in
-       msys64\mingw64\.
-    3. Download Ubuntu 22.04 (jammy) cloud qcow2 image, verify SHA256.
+    1. Download the prebuilt QEMU portable bundle from GitHub Releases
+       (x86_64-only; UI stripped; non-x86 firmware excluded -- ~120 MB
+       compressed vs. ~700 MB MSYS2 install). Verify SHA256, extract to
+       <project>\qemu\. Built by .github/workflows/build-qemu-bundle.yml.
+       Override with -QemuBundleUrl / -QemuBundleSha256 or env vars
+       SIREPO_WIN_QEMU_URL / SIREPO_WIN_QEMU_SHA256 for testing.
+    2. Download Ubuntu 22.04 (jammy) cloud qcow2 image, verify SHA256.
        Jammy chosen over noble (24.04) because noble's 6.8 kernel panics on
        IO-APIC timer init under QEMU TCG. Override $UbuntuUrl to pick a
        different release.
-    4. Create a writable overlay qcow2 so the base image stays pristine.
-    5. Generate a NoCloud cloud-init seed ISO inlining install-sirepo.sh,
+    3. Create a writable overlay qcow2 so the base image stays pristine.
+    4. Generate a NoCloud cloud-init seed ISO inlining install-sirepo.sh,
        the windows_native job-driver patch, the sirepo.service unit, and a
        mount-host-runs.sh helper. cloud-init's runcmd: apt install davfs2
        + git, mount the worker's WebDAV /dav share at /mnt/host-runs (narrow
        data pipe -- just SRW job dirs), git clone sirepo+pykern to /opt/,
        run install-sirepo.sh --patches.
-    6. Before launching QEMU: verify the worker (which serves /run + /dav)
+    5. Before launching QEMU: verify the worker (which serves /run + /dav)
        is running on 127.0.0.1:$WorkerPort. Fail fast if not.
-    7. Launch QEMU with user-mode networking + hostfwd of $HostPort:8000.
+    6. Launch QEMU with user-mode networking + hostfwd of $HostPort:8000.
        Tries WHPX first (Windows Hypervisor Platform, ~1.5x native), falls
        back to TCG software emulation (10-50x slower for SRW FP work, but
        Sirepo itself is just I/O/HTTP -- compute is on the Windows side).
 
-  Cloud-init installs and starts Sirepo on first boot. Total bundle for the
-  QEMU backend (msys64 + QEMU + Ubuntu jammy image + overlay + python-native):
-  ~1.5 GB.
+  Cloud-init installs and starts Sirepo on first boot. Total bundle on disk
+  (qemu/ + Ubuntu jammy image + overlay + python-native): ~1 GB.
 
 .PARAMETER UbuntuUrl
   HTTPS URL of Ubuntu cloud qcow2.
@@ -70,6 +65,12 @@ param(
     # params if you have a TCG fix and want noble back.
     [string]$UbuntuUrl     = 'https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img',
     [string]$Sha256SumsUrl = 'https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS',
+    # Prebuilt portable QEMU bundle. Defaults read SIREPO_WIN_QEMU_URL /
+    # SIREPO_WIN_QEMU_SHA256 (set by setup.ps1 or for local-bundle testing).
+    # The "real" prod URL lives in setup.ps1 as a constant; this script
+    # accepts overrides without caring where the URL points.
+    [string]$QemuBundleUrl    = ($env:SIREPO_WIN_QEMU_URL),
+    [string]$QemuBundleSha256 = ($env:SIREPO_WIN_QEMU_SHA256),
     [int]   $Memory        = 4,
     [int]   $Cpus          = 2,
     [int]   $HostPort      = 8000,
@@ -85,18 +86,16 @@ Set-StrictMode -Version Latest
 
 # --- Paths (all project-local) ---
 $ProjectRoot   = Split-Path -Parent $PSScriptRoot
-$Msys64Dir     = Join-Path $ProjectRoot 'msys64'
+$QemuDir       = Join-Path $ProjectRoot 'qemu'
 $VmDir         = Join-Path $ProjectRoot 'qemu-vm'
 $CacheDir      = Join-Path $ProjectRoot '.cache'
-$MsysBootstrap = Join-Path $PSScriptRoot 'bootstrap-msys2.ps1'
 
-$BootstrapMarker  = Join-Path $Msys64Dir '.sirepo-win-bootstrap-ok'
-$QemuPacmanMarker = Join-Path $Msys64Dir '.qemu-installed-ok'
-$VmReadyMarker    = Join-Path $VmDir '.vm-ready'
+$QemuReadyMarker = Join-Path $QemuDir '.qemu-ready'
+$VmReadyMarker   = Join-Path $VmDir '.vm-ready'
 
-$QemuExe        = Join-Path $Msys64Dir 'mingw64\bin\qemu-system-x86_64.exe'
-$QemuImgExe     = Join-Path $Msys64Dir 'mingw64\bin\qemu-img.exe'
-$QemuShareDir   = Join-Path $Msys64Dir 'mingw64\share\qemu'
+$QemuExe        = Join-Path $QemuDir 'bin\qemu-system-x86_64.exe'
+$QemuImgExe     = Join-Path $QemuDir 'bin\qemu-img.exe'
+$QemuShareDir   = Join-Path $QemuDir 'share\qemu'
 
 $BaseImage      = Join-Path $CacheDir 'ubuntu-22.04-jammy-amd64.qcow2'
 $OverlayImage   = Join-Path $VmDir 'overlay.qcow2'
@@ -118,42 +117,75 @@ $WebdavGuestUrl = "http://10.0.2.2:$WorkerPort/dav/"
 
 Write-Host "=== Sirepo_Win embedded-VM (QEMU) bootstrap ==="
 Write-Host "project root: $ProjectRoot"
-Write-Host "msys64 dir:   $Msys64Dir  (portable QEMU lives here)"
+Write-Host "qemu dir:     $QemuDir  (portable QEMU bundle extracted here)"
 Write-Host "vm dir:       $VmDir"
 Write-Host ""
 
 New-Item -ItemType Directory -Force -Path $VmDir, $CacheDir, $RunsHost | Out-Null
 
-# --- 1. Bootstrap MSYS2 (portable, no admin) ---
-if (-not (Test-Path $BootstrapMarker)) {
-    Write-Host "--- MSYS2 not present; running bootstrap-msys2.ps1 ---"
-    if (-not (Test-Path $MsysBootstrap)) {
-        throw "Missing $MsysBootstrap"
-    }
-    & $MsysBootstrap
-    if ($LASTEXITCODE -ne 0 -and -not (Test-Path $BootstrapMarker)) {
-        throw "bootstrap-msys2.ps1 failed."
-    }
+# --- 1. Fetch + extract the prebuilt portable QEMU bundle ---
+# Built by .github/workflows/build-qemu-bundle.yml on a Windows runner that
+# pacman-installs MSYS2's mingw-w64-x86_64-qemu, stages just the bits we use
+# (qemu-system-x86_64.exe, qemu-img.exe, runtime DLLs, x86 firmware), and
+# publishes a zip to GitHub Releases. ~120 MB compressed vs. ~700 MB MSYS2.
+if ((Test-Path $QemuReadyMarker) -and (Test-Path $QemuExe) -and -not $Force) {
+    $ready = Get-Content $QemuReadyMarker -Raw
+    Write-Host "QEMU bundle already extracted at $QemuDir"
+    Write-Host ($ready.Trim() -split "`n" | ForEach-Object { "  $_" }) -Separator "`n"
 } else {
-    Write-Host "MSYS2 already bootstrapped at $Msys64Dir"
-}
+    if (-not $QemuBundleUrl) {
+        throw @"
+No QEMU bundle URL configured. Either:
+  - run .github/workflows/build-qemu-bundle.yml once and set
+    SIREPO_WIN_QEMU_URL + SIREPO_WIN_QEMU_SHA256 to the release asset, or
+  - pass -QemuBundleUrl / -QemuBundleSha256 to this script.
+Bundle layout expected: zip with bin/qemu-system-x86_64.exe at top level.
+"@
+    }
 
-$BashExe = Join-Path $Msys64Dir 'usr\bin\bash.exe'
-if (-not (Test-Path $BashExe)) { throw "MSYS2 bash missing at $BashExe" }
+    if (Test-Path $QemuDir) { Remove-Item -Recurse -Force $QemuDir }
+    New-Item -ItemType Directory -Force -Path $QemuDir | Out-Null
 
-# --- 2. pacman -S mingw-w64-x86_64-qemu (portable QEMU + DLL deps) ---
-if ((Test-Path $QemuPacmanMarker) -and (Test-Path $QemuExe) -and -not $Force) {
-    Write-Host "QEMU already pacman-installed in msys64/mingw64/."
-} else {
-    Write-Host "--- Installing mingw-w64-x86_64-qemu via pacman (this pulls ~500 MB of deps) ---"
-    & $BashExe -lc 'pacman -S --needed --noconfirm --noprogressbar mingw-w64-x86_64-qemu'
-    if ($LASTEXITCODE -ne 0) { throw "pacman install of qemu failed (exit $LASTEXITCODE)" }
-    if (-not (Test-Path $QemuExe)) { throw "qemu-system-x86_64.exe missing at $QemuExe after pacman install" }
-    $qemuPkgVersion = (& $BashExe -lc 'pacman -Q mingw-w64-x86_64-qemu' | Out-String).Trim()
+    $bundleZip = Join-Path $CacheDir 'qemu-portable.zip'
+    Write-Host "--- Downloading QEMU bundle ($QemuBundleUrl) ---"
+    $oldPP = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    try {
+        if ($QemuBundleUrl.StartsWith('file:///', [StringComparison]::OrdinalIgnoreCase)) {
+            # Local-file URL for testing. Convert to a normal path and copy.
+            $localPath = [Uri]::new($QemuBundleUrl).LocalPath
+            Copy-Item -Path $localPath -Destination $bundleZip -Force
+        } else {
+            Invoke-WebRequest -Uri $QemuBundleUrl -OutFile $bundleZip -UseBasicParsing
+        }
+    } finally { $ProgressPreference = $oldPP }
+
+    if ($QemuBundleSha256) {
+        $actual = (Get-FileHash $bundleZip -Algorithm SHA256).Hash.ToLower()
+        $expected = $QemuBundleSha256.Trim().ToLower()
+        if ($actual -ne $expected) {
+            Remove-Item $bundleZip -Force
+            throw "QEMU bundle SHA256 mismatch (expected $expected, got $actual). Cached file removed; re-run."
+        }
+        Write-Host "Bundle verified: $actual"
+    } else {
+        Write-Host "WARNING: no SHA256 provided; skipping integrity check." -ForegroundColor Yellow
+    }
+
+    Write-Host "--- Extracting bundle to $QemuDir ---"
+    Expand-Archive -Path $bundleZip -DestinationPath $QemuDir -Force
+    if (-not (Test-Path $QemuExe)) {
+        throw "After extract, qemu-system-x86_64.exe missing at $QemuExe -- bundle layout wrong?"
+    }
+
+    $verFile = Join-Path $QemuDir 'VERSION.txt'
+    $verLine = if (Test-Path $verFile) { (Get-Content -Raw $verFile).Trim() } else { '(unknown)' }
     @"
 date: $(Get-Date -Format o)
-qemu: $qemuPkgVersion
-"@ | Set-Content $QemuPacmanMarker -Encoding UTF8
+url:  $QemuBundleUrl
+sha:  $QemuBundleSha256
+qemu: $verLine
+"@ | Set-Content $QemuReadyMarker -Encoding UTF8
 }
 
 Write-Host "Using: $QemuExe"

@@ -1,7 +1,8 @@
 # Portable installs — bulky, reproducible from scripts, never committed.
-/msys64/
+/qemu/
 /python-native/
 /qemu-vm/
+/msys64/         # historical: previously bootstrapped MSYS2; now replaced by /qemu/
 
 # Download cache fetched at bootstrap time.
 /.cache/

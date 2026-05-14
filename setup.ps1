@@ -40,6 +40,13 @@ param(
     [int]   $Cpus       = 2,
     [int]   $HostPort   = 8000,
     [int]   $WorkerPort = 8311,
+    # QEMU bundle: built by .github/workflows/build-qemu-bundle.yml and
+    # uploaded to GitHub Releases. Override locally for testing with a
+    # file:/// URL or pass -QemuBundleUrl / -QemuBundleSha256. Env vars
+    # SIREPO_WIN_QEMU_URL / SIREPO_WIN_QEMU_SHA256 also work.
+    [string]$QemuBundleUrl    = $(if ($env:SIREPO_WIN_QEMU_URL) { $env:SIREPO_WIN_QEMU_URL }
+                                  else { 'https://github.com/dotnet00/Sirepo_Win/releases/download/qemu-portable-v11.0.0-r1/qemu-portable.zip' }),
+    [string]$QemuBundleSha256 = $(if ($env:SIREPO_WIN_QEMU_SHA256) { $env:SIREPO_WIN_QEMU_SHA256 } else { '' }),
     [switch]$Force
 )
 
@@ -135,6 +142,8 @@ $qemuArgs = @{
     HostPort   = $HostPort
     WorkerPort = $WorkerPort
 }
+if ($QemuBundleUrl)    { $qemuArgs.QemuBundleUrl    = $QemuBundleUrl }
+if ($QemuBundleSha256) { $qemuArgs.QemuBundleSha256 = $QemuBundleSha256 }
 if ($Force) { $qemuArgs.Force = $true }
 
 try {
