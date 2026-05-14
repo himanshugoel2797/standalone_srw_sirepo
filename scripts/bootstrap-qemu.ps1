@@ -403,7 +403,7 @@ runcmd:
   - |
     bash -c '
       set -euo pipefail
-      stage() { echo "$1" > /var/lib/sirepo/install-stage; }
+      stage() { echo "`$1" > /var/lib/sirepo/install-stage; }
       stage clone-pykern
       git clone --depth 50 https://github.com/radiasoft/pykern.git /opt/pykern
       stage clone-sirepo
